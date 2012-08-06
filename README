@@ -1,0 +1,6 @@
+ARM-Board Host Program
+======================
+
+An ARM program designed to run on the Manchester Lab Board v1.1 to provide
+loading, debug and control facilities to a simple processor running onboard the
+FPGA.
