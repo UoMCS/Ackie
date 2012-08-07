@@ -91,6 +91,7 @@ ELEMENT_SIZE_2	EQU 0x1 ; 2 Bytes
 ELEMENT_SIZE_4	EQU 0x2 ; 4 Bytes
 ELEMENT_SIZE_8	EQU 0x3 ; 8 Bytes
 	
+PACKET_LENGTH	EQU 255
 	
 	;------------------------------------------------------
 	; FPGA Interface Definitions
@@ -117,6 +118,17 @@ STUMP_WR	EQU 0x2
 	
 SCAN_CLK	EQU 0x1
 SCAN_EN	EQU 0x2
+	
+	; FPGA Pins
+FPGA_INIT_B	EQU 0x00040000
+FPGA_RDWR_B	EQU 0x00020000
+FPGA_CS_B	EQU 0x00010000
+FPGA_CCLK	EQU 0x00000002
+FPGA_PROG_B	EQU 0x00000001
+	
+	; The FPGA programming bus
+FPGA_BUS_SHIFT	EQU 23
+FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
 	
 	
 	;------------------------------------------------------
@@ -181,7 +193,7 @@ main	; Set the default MMU translation table from ROM
 	MCR  P15, 0, R0, C1, C0, 0
 	
 	; Set up global register values
-	MOVX R8,  #STATE_RESET ; CPU State
+	MOVX R8,  #STATE_BUSY ; CPU State
 	MOVX R9,  #0 ; Steps executed
 	MOVX R10, #0 ; Steps remaining
 	MOVX R11, #USART_BASE
@@ -357,6 +369,27 @@ serial_write_loop	LDRB R0, [R1], #1
 	
 	
 	;------------------------------------------------------
+	; Read some data from the serial port. This function
+	; will block until the read completes.
+	;
+	; Argument:
+	;   R1: The start address of the location to write to
+	;   R2: The length in bytes
+	;------------------------------------------------------
+	
+serial_read_data	STMFD SP!, {R0, R1, R2, LR}
+	
+	; Receive each byte in turn and send it
+serial_read_loop	BL   serial_read
+	STRB R0, [R1], #1
+	SUBS R2, R2, #1
+	BNE  serial_read_loop
+	
+	; Return
+	LDMFD SP!, {R0, R1, R2, PC}
+	
+	
+	;------------------------------------------------------
 	; Read from the memory space occupied by the CPU
 	;
 	; Argument:
@@ -484,12 +517,12 @@ cmd_jmp_table	B cmd_nop         ; 0x00
 	B cmd_nop         ; 0x0D
 	B cmd_nop         ; 0x0E
 	B cmd_nop         ; 0x0F
-	B cmd_nop;cmd_fr_get      ; 0x10 Feature get status
-	B cmd_nop;cmd_fr_set      ; 0x11 Feature set status
+	B cmd_fr_get      ; 0x10 Feature get status
+	B cmd_fr_set      ; 0x11 Feature set status
 	B cmd_nop;cmd_fr_write    ; 0x12 Feature send message
 	B cmd_nop;cmd_fr_read     ; 0x13 Feature get message
-	B cmd_nop;cmd_fr_file     ; 0x14 Feature download header
-	B cmd_nop;cmd_fr_send     ; 0x15 Feature download data
+	B cmd_fr_file     ; 0x14 Feature download header
+	B cmd_fr_send     ; 0x15 Feature download data
 	B cmd_nop         ; 0x16
 	B cmd_nop         ; 0x17
 	B cmd_nop         ; 0x18
@@ -527,12 +560,101 @@ cmd_wot_r_u	ADR  R1, CPU_INFO
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Reset the CPU being tested
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_reset	MOV R8, #STATE_RESET ; Enter reset state
-	MOV R9,  #0          ; Reset step counter
-	MOV R10, #0          ; No more steps to execute
+cmd_reset	; Does nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
+	
+	MOV R8,  #STATE_RESET ; Enter reset state
+	MOV R9,  #0           ; Reset step counter
+	MOV R10, #0           ; No more steps to execute
 	
 	B handle_command_return
 	
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Feature get state
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+cmd_fr_get	; Read feature number
+	BL serial_read
+	
+	; Always return 0
+	MOV R0, #0
+	BL  serial_write_word
+	
+	B handle_command_return
+	
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Feature set state
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+cmd_fr_set	; Read feature number
+	BL serial_read
+	
+	; Ignore value recieved
+	BL serial_read_word
+	
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Feature recieve download header
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+cmd_fr_file	; As we're downloading a CPU, set it as busy as nothing can
+	; happen to it for now.
+	MOV R8, #STATE_BUSY
+	
+	; Read feature number
+	BL serial_read
+	
+	; Get size of file and use R10 to store it as a CPU is
+	; being loaded so this register isn't used
+	BL  serial_read_word
+	MOV R10, R0
+	
+	; Initialise the FPGA
+	BL  fpga_init
+	
+	; Return 'A' to confirm OK
+	MOV R0, #'A'
+	BL  serial_write
+	
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Feature recieve download data
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+cmd_fr_send	; Read (and ignore) feature number
+	BL serial_read
+	
+	; Read the number of bytes in packet (0 = 256)
+	BL serial_read
+	MOVS  R2, R0
+	MOVEQ R2, #256
+	
+	; Write into the CPU's ram space as its not being used
+	; for anything else...
+	MOVX R1, #MEMORY_START
+	
+	; Read the packet into a buffer (so that no bytes are
+	; missed due to slowness in loading onto FPGA
+	BL serial_read_data
+	
+	; Send buffer to fpga (returns success char in R0)
+	BL fpga_send
+	
+	; If the download has completed, set the system up
+	; ready to drive it and start the FPGA running.
+	SUBS R10, R10, R2
+	BGT  %f0
+	
+	; Set up system
+	MOV R8,  #STATE_RESET ; In the reset state
+	MOV R9,  #0           ; No steps executed
+	MOV R10, #0           ; No steps remaining
+	
+	; Done! Return the success char.
+0	BL  serial_write
+	
+	B handle_command_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Get CPU status
@@ -541,12 +663,12 @@ cmd_wot_u_do	; CPU State
 	MOV R0, R8
 	BL serial_write
 	
-	; Steps executed
-	MOV R0, R9
-	BL serial_write_word
-	
 	; Steps remaining
 	MOV R0, R10
+	BL serial_write_word
+	
+	; Steps executed
+	MOV R0, R9
 	BL serial_write_word
 	
 	B handle_command_return
@@ -555,7 +677,11 @@ cmd_wot_u_do	; CPU State
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Stop the CPU & clear remaining steps
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_stop	; Stop the CPU
+cmd_stop	; Does nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
+	
+	; Stop the CPU
 	MOV R8, #STATE_STOPPED
 	
 	; Clear remaining steps
@@ -567,7 +693,11 @@ cmd_stop	; Stop the CPU
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Pause the CPU not clearning remaining steps
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_pause	; Stop the CPU
+cmd_pause	; Does nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
+	
+	; Stop the CPU
 	MOV R8, #STATE_STOPPED
 	
 	B handle_command_return
@@ -576,7 +706,11 @@ cmd_pause	; Stop the CPU
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Resume CPU execution
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_continue	; Don't resume if no steps remaining
+cmd_continue	; Does nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
+	
+	; Don't resume if no steps remaining
 	CMP R10, #0
 	BEQ handle_command_return
 	
@@ -678,13 +812,24 @@ cmd_mem_write	; Write to memory
 	; Behaviour when >1 word read/writes are done is
 	; undefined.
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_reg	; Read or write? (flag is stored until branch)
-	TST R1, #READ_BIT
+cmd_reg	; Store a copy of R1 before masking
+	MOV R0, R1
 	
-	; Mask off the element size and take a copy in words
-	; (R4) and in bytes (R1).
-	AND R1, R1, #ELEMENT_SIZE_MASK
-	SUB R4, R1, #1
+	; Mask off the element size and take a copy in terms of
+	; words (R4) and in bytes (R0).
+	AND  R1, R1, #ELEMENT_SIZE_MASK
+	SUBS R4, R1, #1
+	
+	; If reading bytes this value will be -1 but since
+	; 1<<-1 wouldn't yield a sensible step-size for each
+	; read as it would when not -1, just use 0 and we'll
+	; step one word at a time (which, while not strictly
+	; correct, is about the most sensible thing we can do
+	; given we can't step by bytes).
+	MOVMI R4, #0
+	
+	; Read or write? (flag is stored until branch)
+	TST R0, #READ_BIT
 	
 	; Put the target address in R4 (note that the length is
 	; shifted/multiplied to take into account the element
@@ -733,7 +878,7 @@ cmd_reg_write	; Write to memory
 	; Advance to next address and loop
 	ADD R2, R2, #1
 	CMP R2, R4
-	BLO %b0
+	BNE %b0
 	B   handle_command_return
 	
 1	; Byte access
@@ -742,7 +887,7 @@ cmd_reg_write	; Write to memory
 	; Advance to next address and loop
 	ADD R2, R2, #1
 	CMP R2, R4
-	BLO %b0
+	BNE %b0
 	B   handle_command_return
 	
 	
@@ -754,6 +899,10 @@ cmd_reg_write	; Write to memory
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 handle_command_exec	; Read the number of steps
 	BL  serial_read_word
+	
+	; Do nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
 	
 	; Set the number of steps remaining
 	MOV R10, R0
@@ -772,3 +921,143 @@ cmd_nop	; Not implemented, just fall through to return
 	
 	; Return XXX
 handle_command_return	LDMFD SP!, {R0-R3, PC}
+
+
+	;-----------------------------------------------------
+	; Get the FPGA ready for a download.
+	;-----------------------------------------------------
+fpga_init	STMFD SP!, {R1-R2, LR}
+	
+	; Get PIO port base address
+	MOVX LR, #PIOC
+	
+	; Set INIT_B pin as input
+	mov  r1, #FPGA_INIT_B
+	str  r1, [LR, #PIO_ODR]
+	str  r1, [LR, #PIO_PER]
+
+	; Put the FPGA in programming mode (set PROG_B = 0)
+	MOV  R1, #FPGA_PROG_B
+	STR  R1, [LR, #PIO_CODR]
+	
+	; Wait for >500ns to allow memory clearing to start
+	MOV  R2, #100
+0	SUBS R2, R2, #1
+	BNE  %b0
+	
+	; Check INIT_B is low indicating FPGA is ready to be
+	; programmed
+1	LDR  R2, [LR, #PIO_PDSR]
+	TST  R2, #FPGA_INIT_B
+	BNE  %b1
+	
+	; Set PROG_B high again
+	STR  R1, [LR, #PIO_SODR]
+	
+	; Wait for FPGA to be ready (INIT_B to become 1)
+2	LDR  R2, [LR, #PIO_PDSR]
+	TST  R2, #FPGA_INIT_B
+	BEQ  %b2
+	
+	; Download should not commence for >5us. This is
+	; assumed to be ensured by the speed of the serial
+	; port.
+	
+	LDMFD SP!, {R1-R2, PC}
+	
+	;-----------------------------------------------------
+	; Send some data into the FPGA
+	;
+	; Arguments:
+	;   R1: Address of data
+	;   R2: Number of bytes
+	;
+	; Returns:
+	;   R0: "A" if good, "N" otherwise.
+	;-----------------------------------------------------
+fpga_send	STMFD SP!, {R5-R6, LR}
+	
+	; Get Port-C's base address
+	MOVX LR, #PIOC
+	
+	
+	; Record pin direction/data for restoring later
+	LDR  R4, [LR, #PIO_OSR]  ; Get PIO direction
+	LDR  R5, [LR, #PIO_ODSR] ; Get PIO output data
+	PUSH {R4, R5}
+	
+	; FPGA data-in bus pins
+	MOVX R5, #FPGA_BUS
+	MVN  R6, R5
+	
+	; Output enable bus
+	STR  R5, [LR, #PIO_OER]
+	; Enable bus direct write for data bus
+	STR  R5, [LR, #PIO_OWER]
+	; Disable for all other pins
+	STR  R6, [LR, #PIO_OWDR]
+	
+	; Setup FPGA ctrl bits initially
+	; RDWR=0
+	MOV R6, #FPGA_RDWR_B
+	STR R6, [LR, #PIO_CODR]
+	; CCLK=1
+	MOV R6, #FPGA_CCLK
+	STR R6, [LR, #PIO_SODR]
+	; CS=0
+	MOV R6, #FPGA_CS_B
+	STR R6, [LR, #PIO_CODR]
+	
+	MOV R6, #FPGA_CCLK
+
+fpga_send_byte	; Get the byte to send
+	LDR R0, [R1], #1
+	
+	; CCLK low
+	STR R6, [LR, #PIO_CODR]
+	
+	; Check for FPGA load failiure
+	LDR R5, [LR, #PIO_PDSR]
+	TST R5, #FPGA_INIT_B
+	
+	; Load failed (e.g. checksum failed), return 'N'
+	MOVEQ R0, #'N'
+	BEQ   fpga_send_return
+	
+	; Shift up to bits 30-23 (the data pins on the bus) and
+	; send to the bus
+	MOV R0, R0, LSL #FPGA_BUS_SHIFT
+	STR R0, [LR, #PIO_ODSR]
+	
+	; CCLK high
+	STR R6, [LR, #PIO_SODR]
+	
+	; Decrement the counter
+	SUBS R2, R2, #1
+	BHI  fpga_send_byte
+	
+	MOV  R0, #'A'
+	B fpga_send_return
+	
+	
+fpga_send_return	; CS=1
+	MOV R6, #FPGA_CS_B
+	STR R6, [LR, #PIO_SODR]
+	
+	; Disable bus direct write
+	MOV R6, #-1
+	STR R6, [LR, #PIO_OWDR]
+	
+	; Recover former status
+	POP {R6, R5}
+	; Set 1s and clear 0s
+	STR R5, [LR, #PIO_SODR]
+	MVN R5, R5
+	STR R5, [LR, #PIO_CODR]
+	
+	; Enable/disable outputs as they were
+	STR R6, [LR, #PIO_OER]
+	MVN R6, R6
+	STR R6, [LR, #PIO_ODR]
+	
+	LDMFD SP!, {R5-R6, PC}
