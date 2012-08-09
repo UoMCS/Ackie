@@ -3,6 +3,8 @@
 	include header.s
 	include usart.h
 	include pio.h
+	include tc.h
+	include pmc.h
 	
 	
 	;------------------------------------------------------
@@ -228,30 +230,38 @@ main	; Set the default MMU translation table from ROM
 	MOV R1, #FPGA_CS_B
 	STR R1, [R0, #PIO_CODR]
 	
+	; Power up the first timer
+	MOVX R0, #PMC_BASE
+	MOV  R1, #PMC_TC0
+	STR  R1, [R0, #PMC_PCER]
+	
+	; Load the timer base-address
+	MOVX R0, #TC_BASE
+	
+	; Set up timer
+	;           +- MCK/32 as clock source
+	;           |        +- TIOA as ext trigger
+	;           |        |         +- Wave mode
+	;           |        |         |
+	MOVX R1, #0b011 | (1<<10) | (1<<15)
+	STR  R1, [R0, #TC_CMR]
+	
+	; Enable timer and trigger it
+	MOVX R1, #(1<<0) | (1<<2)
+	STR  R1, [R0, #TC_CCR]
+	
 	
 main_loop	; Main-loop
-	; If busy, don't light the LEDs
-	CMP R8, #STATE_BUSY
-	BEQ  %f0
-	
-	; Light the LEDs corresponding to the bottom-byte of
-	; the half-word read from the fpga at FPGA_BASE
-	MOVX R0, #PIOC
-	MOVX R1, #FPGA_BASE
-	LDRH R1, [R1, #4]
-	MVN  R3, R1
-	
-	AND  R2, R1, #0xFF
-	AND  R3, R3, #0xFF
-	MOV  R2, R2, LSL #FPGA_BUS_SHIFT
-	MOV  R3, R3, LSL #FPGA_BUS_SHIFT
-	
-	STR  R2, [R0, #PIO_SODR]
-	STR  R3, [R0, #PIO_CODR]
 	
 	; Handle incoming commands
 0	BL handle_command
-	B main_loop
+	
+	; Run the idle process (just to make sure it happens at
+	; some point)
+	BL idle_process
+	
+	; Loop-de-loop!
+	B  main_loop
 	
 	; Shouldn't get here!
 	B .
@@ -267,10 +277,15 @@ main_loop	; Main-loop
 	;   R0: The byte read
 	;------------------------------------------------------
 	
-serial_read	; Check the status register to see if data is available
-	LDR R0, [R11, #US_CSR]
+serial_read	STMFD SP!, {LR}
+	; Check the status register to see if data is available
+	; Run the idle process while waiting
+0	LDR R0, [R11, #US_CSR]
 	TST R0, #US_RXRDY
-	BEQ serial_read
+	BNE %f1
+	BL  idle_process
+	B   %b0
+1	
 	
 	; Data is available, retrieve it
 	LDR R0, [R11, #US_RHR]
@@ -279,7 +294,7 @@ serial_read	; Check the status register to see if data is available
 	AND R0, R0, #0xFF
 	
 	; Return
-	MOV PC, LR
+	LDMFD SP!, {PC}
 	
 	
 	;------------------------------------------------------
@@ -299,10 +314,13 @@ serial_write	STMFD SP!, {R0, LR}
 	AND R0, R0, #0xFF
 	
 	; Check the status register to see if the transmitter
-	; is ready. Busy-loop until it is.
+	; is ready. Run the idle process while waiting.
 0	LDR LR, [R11, #US_CSR]
 	TST LR, #US_TXRDY
-	BEQ %b0
+	BNE %f1
+	BL  idle_process
+	B   %b0
+1	
 	
 	; Transmitter is ready, send the data
 	STR R0, [R11, #US_THR]
@@ -1071,3 +1089,38 @@ fpga_send_return	; CCLK low
 	STR R6, [LR, #PIO_SODR]
 	
 	LDMFD SP!, {R1-R2, R5-R6, PC}
+	
+	
+	
+	;-----------------------------------------------------
+	; Idle process which should be executed whenever the
+	; system is blocked for some reason.
+	;
+	; Contains the control logic which clocks, extracts
+	; registers and emulates memory for the CPU running in
+	; the FPGA.
+	;-----------------------------------------------------
+	; XXX
+idle_process	STMFD SP!, {R0-R1, LR}
+	
+	MOV R0, #0
+	
+	MOVX LR, #TC_BASE
+	
+	LDR  R1, [LR, #TC_CV]
+	STR  R1, [R0]
+	
+	LDR  R1, [LR, #TC_CMR]
+	STR  R1, [R0,#4]
+	
+	LDR  R1, [R0,#8]
+	ADD  R1, R1, #1
+	STR  R1, [R0,#8]
+	
+	; Reset timer it
+	MOVX R1, #1<<2
+	STR  R1, [LR, #TC_CCR]
+	
+	; XXX
+	LDMFD SP!, {R0-R1, PC}
+	
