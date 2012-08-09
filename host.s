@@ -19,13 +19,13 @@
 	; R14: LR
 	;------------------------------------------------------
 
-maker	EQU	3
-version	EQU	0
-day	EQU	5
-month	EQU	8
-year	EQU	12
+maker	EQU 3
+version	EQU 0
+day	EQU 5
+month	EQU 8
+year	EQU 12
 	
-	; XXX: The location of the program in RAM
+	; The location of the program in ROM
 ROM_START	EQU 0x30000
 	
 	; Default MMU translation table included in ROM
@@ -39,8 +39,8 @@ CPU_TYPE	EQU 3
 CPU_SUBTYPE	EQU 0
 	
 	; The FPGA (feature) type
-FPGA_TYPE	EQU 14
-FPGA_SUBTYPE	EQU 0x0200
+FPGA_TYPE	EQU 0x14
+FPGA_SUBTYPE	EQU 0x0211
 	
 	;------------------------------------------------------
 	; Simulation Definitions
@@ -199,12 +199,29 @@ main	; Set the default MMU translation table from ROM
 	MOVX R11, #USART_BASE
 	MOVX R12, #FPGA_BASE
 	
-	; XXX
-	MOV R5, #0
 	
+main_loop	; Main-loop
+	; If busy, don't light the LEDs
+	CMP R8, #STATE_BUSY
+	BEQ  %f0
 	
-	; Main-loop: handle new commands
-main_loop	BL handle_command
+	; Light the LEDs corresponding to the bottom-byte of
+	; the half-word read from the fpga at FPGA_BASE
+	MOVX R0, #PIOC
+	MOVX R1, #FPGA_BASE
+	LDRH R1, [R1, #4]
+	MVN  R3, R1
+	
+	AND  R2, R1, #0xFF
+	AND  R3, R3, #0xFF
+	MOV  R2, R2, LSL #FPGA_BUS_SHIFT
+	MOV  R3, R3, LSL #FPGA_BUS_SHIFT
+	
+	STR  R2, [R0, #PIO_SODR]
+	STR  R3, [R0, #PIO_CODR]
+	
+	; Handle incoming commands
+0	BL handle_command
 	B main_loop
 	
 	; Shouldn't get here!
@@ -468,7 +485,6 @@ register_write	; XXX: Not implemented!
 	;------------------------------------------------------
 	; Read and execute a command
 	;------------------------------------------------------
-	; XXX
 handle_command	STMFD SP!, {R0-R3, LR}
 	
 	; Read the command into R0
@@ -919,7 +935,7 @@ handle_command_exec	; Read the number of steps
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 cmd_nop	; Not implemented, just fall through to return
 	
-	; Return XXX
+	; Return
 handle_command_return	LDMFD SP!, {R0-R3, PC}
 
 
@@ -932,16 +948,16 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	MOVX LR, #PIOC
 	
 	; Set INIT_B pin as input
-	mov  r1, #FPGA_INIT_B
-	str  r1, [LR, #PIO_ODR]
-	str  r1, [LR, #PIO_PER]
+	MOV  R1, #FPGA_INIT_B
+	STR  R1, [LR, #PIO_ODR]
+	STR  R1, [LR, #PIO_PER]
 
 	; Put the FPGA in programming mode (set PROG_B = 0)
 	MOV  R1, #FPGA_PROG_B
 	STR  R1, [LR, #PIO_CODR]
 	
 	; Wait for >500ns to allow memory clearing to start
-	MOV  R2, #100
+	MOV  R2, #125
 0	SUBS R2, R2, #1
 	BNE  %b0
 	
@@ -975,7 +991,7 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	; Returns:
 	;   R0: "A" if good, "N" otherwise.
 	;-----------------------------------------------------
-fpga_send	STMFD SP!, {R5-R6, LR}
+fpga_send	STMFD SP!, {R2, R5-R6, LR}
 	
 	; Get Port-C's base address
 	MOVX LR, #PIOC
@@ -1010,7 +1026,13 @@ fpga_send	STMFD SP!, {R5-R6, LR}
 	
 	MOV R6, #FPGA_CCLK
 
-fpga_send_byte	; Get the byte to send
+fpga_send_byte	; Wait before sending byte (simulating the delay added
+	; by waiting on the serial line at this point).
+	MOV  R0, #0x100
+0	SUBS R0, R0, #1
+	BNE  %b0
+	
+	; Get the byte to send from the buffer
 	LDR R0, [R1], #1
 	
 	; CCLK low
@@ -1034,13 +1056,15 @@ fpga_send_byte	; Get the byte to send
 	
 	; Decrement the counter
 	SUBS R2, R2, #1
-	BHI  fpga_send_byte
+	BNE  fpga_send_byte
 	
 	MOV  R0, #'A'
-	B fpga_send_return
 	
 	
-fpga_send_return	; CS=1
+fpga_send_return	; CCLK low
+	STR R6, [LR, #PIO_CODR]
+	
+	; CS=1
 	MOV R6, #FPGA_CS_B
 	STR R6, [LR, #PIO_SODR]
 	
@@ -1060,4 +1084,4 @@ fpga_send_return	; CS=1
 	MVN R6, R6
 	STR R6, [LR, #PIO_ODR]
 	
-	LDMFD SP!, {R5-R6, PC}
+	LDMFD SP!, {R2, R5-R6, PC}
