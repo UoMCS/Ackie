@@ -130,6 +130,10 @@ FPGA_PROG_B	EQU 0x00000001
 FPGA_BUS_SHIFT	EQU 23
 FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
 	
+	; Location in ram (just after program memory) to use as
+	; a buffer for incoming FPGA data.
+FPGA_DATA_BUFFER	EQU (MEMORY_MASK + 1)
+	
 	
 	;------------------------------------------------------
 	; Start of ROM Image
@@ -198,6 +202,31 @@ main	; Set the default MMU translation table from ROM
 	MOVX R10, #0 ; Steps remaining
 	MOVX R11, #USART_BASE
 	MOVX R12, #FPGA_BASE
+	
+	; Get PIO port base address
+	MOVX R0, #PIOC
+	
+	; FPGA data-in bus pins
+	MOVX R1, #FPGA_BUS
+	MVN  R2, R1
+	
+	; Output-enable the bus
+	STR  R1, [R0, #PIO_OER]
+	; Enable bus direct write for data bus
+	STR  R1, [R0, #PIO_OWER]
+	; Disable for all other pins
+	STR  R2, [R0, #PIO_OWDR]
+	
+	; Setup FPGA ctrl bits initially
+	; RDWR=0
+	MOV R1, #FPGA_RDWR_B
+	STR R1, [R0, #PIO_CODR]
+	; CCLK=1
+	MOV R1, #FPGA_CCLK
+	STR R1, [R0, #PIO_SODR]
+	; CS=0
+	MOV R1, #FPGA_CS_B
+	STR R1, [R0, #PIO_CODR]
 	
 	
 main_loop	; Main-loop
@@ -648,7 +677,7 @@ cmd_fr_send	; Read (and ignore) feature number
 	
 	; Write into the CPU's ram space as its not being used
 	; for anything else...
-	MOVX R1, #MEMORY_START
+	MOVX R1, #FPGA_DATA_BUFFER
 	
 	; Read the packet into a buffer (so that no bytes are
 	; missed due to slowness in loading onto FPGA
@@ -947,10 +976,9 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	; Get PIO port base address
 	MOVX LR, #PIOC
 	
-	; Set INIT_B pin as input
-	MOV  R1, #FPGA_INIT_B
-	STR  R1, [LR, #PIO_ODR]
-	STR  R1, [LR, #PIO_PER]
+	; CS=0
+	MOV R6, #FPGA_CS_B
+	STR R6, [LR, #PIO_CODR]
 
 	; Put the FPGA in programming mode (set PROG_B = 0)
 	MOV  R1, #FPGA_PROG_B
@@ -975,6 +1003,10 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	TST  R2, #FPGA_INIT_B
 	BEQ  %b2
 	
+	; CS=1
+	MOV R6, #FPGA_CS_B
+	STR R6, [LR, #PIO_SODR]
+	
 	; Download should not commence for >5us. This is
 	; assumed to be ensured by the speed of the serial
 	; port.
@@ -991,60 +1023,30 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	; Returns:
 	;   R0: "A" if good, "N" otherwise.
 	;-----------------------------------------------------
-fpga_send	STMFD SP!, {R2, R5-R6, LR}
+fpga_send	STMFD SP!, {R1-R2, R5-R6, LR}
 	
 	; Get Port-C's base address
 	MOVX LR, #PIOC
 	
-	
-	; Record pin direction/data for restoring later
-	LDR  R4, [LR, #PIO_OSR]  ; Get PIO direction
-	LDR  R5, [LR, #PIO_ODSR] ; Get PIO output data
-	PUSH {R4, R5}
-	
-	; FPGA data-in bus pins
-	MOVX R5, #FPGA_BUS
-	MVN  R6, R5
-	
-	; Output enable bus
-	STR  R5, [LR, #PIO_OER]
-	; Enable bus direct write for data bus
-	STR  R5, [LR, #PIO_OWER]
-	; Disable for all other pins
-	STR  R6, [LR, #PIO_OWDR]
-	
-	; Setup FPGA ctrl bits initially
-	; RDWR=0
-	MOV R6, #FPGA_RDWR_B
-	STR R6, [LR, #PIO_CODR]
-	; CCLK=1
-	MOV R6, #FPGA_CCLK
-	STR R6, [LR, #PIO_SODR]
 	; CS=0
 	MOV R6, #FPGA_CS_B
 	STR R6, [LR, #PIO_CODR]
 	
 	MOV R6, #FPGA_CCLK
 
-fpga_send_byte	; Wait before sending byte (simulating the delay added
-	; by waiting on the serial line at this point).
-	MOV  R0, #0x100
-0	SUBS R0, R0, #1
-	BNE  %b0
-	
-	; Get the byte to send from the buffer
-	LDR R0, [R1], #1
-	
-	; CCLK low
+fpga_send_byte	; CCLK low
 	STR R6, [LR, #PIO_CODR]
 	
 	; Check for FPGA load failiure
 	LDR R5, [LR, #PIO_PDSR]
 	TST R5, #FPGA_INIT_B
 	
-	; Load failed (e.g. checksum failed), return 'N'
-	MOVEQ R0, #'N'
+	; Load failed (e.g. checksum failed), return 'C'
+	MOVEQ R0, #'C'
 	BEQ   fpga_send_return
+	
+	; Get the byte to send from the buffer
+	LDRB R0, [R1], #1
 	
 	; Shift up to bits 30-23 (the data pins on the bus) and
 	; send to the bus
@@ -1068,20 +1070,4 @@ fpga_send_return	; CCLK low
 	MOV R6, #FPGA_CS_B
 	STR R6, [LR, #PIO_SODR]
 	
-	; Disable bus direct write
-	MOV R6, #-1
-	STR R6, [LR, #PIO_OWDR]
-	
-	; Recover former status
-	POP {R6, R5}
-	; Set 1s and clear 0s
-	STR R5, [LR, #PIO_SODR]
-	MVN R5, R5
-	STR R5, [LR, #PIO_CODR]
-	
-	; Enable/disable outputs as they were
-	STR R6, [LR, #PIO_OER]
-	MVN R6, R6
-	STR R6, [LR, #PIO_ODR]
-	
-	LDMFD SP!, {R2, R5-R6, PC}
+	LDMFD SP!, {R1-R2, R5-R6, PC}
