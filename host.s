@@ -174,7 +174,7 @@ ELEMENT_SIZE_8	EQU 0x3 ; 8 Bytes
 PACKET_LENGTH	EQU 255
 	
 	;------------------------------------------------------
-	; FPGA Interface Definitions
+	; Interface Definitions
 	;------------------------------------------------------
 	
 	; Base address of the FPGA
@@ -217,6 +217,11 @@ FPGA_PROG_B	EQU 0x00000001
 	; The FPGA programming bus
 FPGA_BUS_SHIFT	EQU 23
 FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
+	
+	
+	; The LEDs & Buttons
+LED_BUS_SHIFT	EQU 23
+BUTTON_BUS_SHIFT	EQU 4
 	
 	; Location in ram (just after program memory) to use as
 	; a buffer for incoming FPGA data.
@@ -559,6 +564,10 @@ serial_read_loop	BL   serial_read
 	;------------------------------------------------------
 	; Read from the memory space occupied by the CPU
 	;
+	; The following areas are mapped:
+	;   0x0800: Bottom 8-bits are mapped to the LEDs
+	;   0x0801: Bottom 3-bits are mapped to the buttons
+	;
 	; Argument:
 	;   R2: Address
 	; Returns:
@@ -566,34 +575,121 @@ serial_read_loop	BL   serial_read
 	;------------------------------------------------------
 memory_read	STMFD SP!, {LR}
 	
-	; Mask off the address and convert into a byte address
-	MOVX  R0, #(MEMORY_MASK<<1)
-	AND   LR, R0, R2, LSL #1
+	; Mask off the address
+	MOVX LR, #MEMORY_MASK
+	AND  LR, LR, R2
+	
+	; Is this an LED read?
+	CMP LR, #0x800
+	BNE %f0
+	BL  led_read
+	B   memory_read_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+0	; Is this a button read?
+	MOVX R0, #0x801
+	CMP  LR, R0
+	BNE  %f1
+	BL   button_read
+	B    memory_read_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+1	; This is a plain-n-simple memory access
+	; And convert into a byte address
+	MOV LR, LR, LSL #1
 	
 	; Load the value
 	LDRH  R0, [LR, #MEMORY_START]
 	
-	LDMFD SP!, {PC}
+memory_read_return	LDMFD SP!, {PC}
+	
+	
+	;------------------------------------------------------
+	; Read the state of the LEDs
+	;
+	; Returns:
+	;   R0: LED bits
+	;------------------------------------------------------
+led_read	; Read the state and shift/mask
+	MOVX R0, #PIOC
+	LDR  R0, [R0, #PIO_PDSR]
+	MOV  R0, R0, LSR #LED_BUS_SHIFT
+	AND  R0, R0, #0xFF
+	
+	; Return
+	MOV PC, LR
+	
+	
+	;------------------------------------------------------
+	; Read the state of the buttons
+	;
+	; Returns:
+	;   R0: Button states
+	;------------------------------------------------------
+button_read	; Read the state, invert to active high and shift/mask
+	MOVX R0, #PIOC
+	LDR  R0, [R0, #PIO_PDSR]
+	MVN  R0, R0, LSR #BUTTON_BUS_SHIFT
+	AND  R0, R0, #0x03
+	
+	; Return
+	MOV PC, LR
 	
 	
 	;------------------------------------------------------
 	; Write to the memory space occupied by the CPU
 	;
+	; The following areas are mapped:
+	;   0x0800: Bottom 8-bits are mapped to the LEDs
+	;   0x0801: Bottom 3-bits are mapped to the buttons
+	;
 	; Argument:
 	;   R0: Value
 	;   R2: Address
 	;------------------------------------------------------
-memory_write	STMFD SP!, {R2, LR}
+memory_write	STMFD SP!, {LR}
 	
-	; Mask off the address and convert into a byte address
-	MOVX  LR, #(MEMORY_MASK<<1)
-	AND   R2, LR, R2, LSL #1
+	; Mask off the address
+	MOVX LR, #MEMORY_MASK
+	AND  LR, LR, R2
+	
+	; Is this an LED write?
+	CMP LR, #0x800
+	BNE %f0
+	BL  led_write
+	B   memory_write_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+0	; This is a plain-n-simple memory access
+	; And convert into a byte address
+	MOV LR, LR, LSL #1
 	
 	; Store the value
-	STRH  R0, [R2, #MEMORY_START]
+	STRH  R0, [LR, #MEMORY_START]
 	
-	LDMFD SP!, {R2, PC}
+memory_write_return	LDMFD SP!, {PC}
 	
+	
+	;------------------------------------------------------
+	; Set the state of the LEDs
+	;
+	; Argument:
+	;   R0: LED bits
+	;------------------------------------------------------
+led_write	STMFD SP!, {R0, LR}
+	
+	; Shift and mask
+	AND  R0, R0, #0xFF
+	MOV  R0, R0, LSL #LED_BUS_SHIFT
+	
+	; Write to the LEDs
+	MOVX LR, #PIOC
+	STR  R0, [LR, #PIO_ODSR]
+	
+	LDMFD SP!, {R0, PC}
 	
 	;------------------------------------------------------
 	; Read register values from the CPU
