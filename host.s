@@ -1,4 +1,16 @@
-	; ARM Host
+	; ARM Host Program
+	;
+	; (c) August 2012
+	; Jonathan Heathcote / University of Manchester
+	;
+	; This program implements the Komodo comms
+	; interface and exposes a suitably-instrumented
+	; 16-bit memory-word processor implemented on the
+	; FPGA.
+	;
+	; The program begins execution from 'main'.
+	;
+	; A number of registers are reserved for global use.
 	
 	include header.s
 	include usart.h
@@ -10,7 +22,7 @@
 	;------------------------------------------------------
 	; Global Definitions
 	;
-	; The following registers are globals:
+	; The following registers are also globals:
 	;
 	; R7:  Idle process state
 	; R8:  CPU State
@@ -21,12 +33,6 @@
 	; R13: SP
 	; R14: LR
 	;------------------------------------------------------
-
-maker	EQU 3
-version	EQU 0
-day	EQU 5
-month	EQU 8
-year	EQU 12
 	
 	; The location of the program in ROM
 ROM_START	EQU 0x30000
@@ -37,9 +43,13 @@ TRANSLATION_TABLE	EQU 0x8000 | ROM_base
 	; The serial port to use
 USART_BASE	EQU USART1_BASE
 	
-	; The CPU type (3 = STUMP, 4 = MU0)
-CPU_TYPE	EQU 3
-CPU_SUBTYPE	EQU 0
+	; The CPU type
+CPU_TYPE_UNKNOWN	EQU 0xFF
+CPU_TYPE_STUMP	EQU 3
+CPU_TYPE_MU0	EQU 4
+CPU_SUBTYPE_UNKNOWN	EQU 0xFFFF
+CPU_SUBTYPE_REG_AND_MEM	EQU 0x0000
+CPU_SUBTYPE_MEMORY_ONLY	EQU 0x0001
 	
 	; The FPGA (feature) type
 FPGA_TYPE	EQU 0x14
@@ -52,7 +62,7 @@ FPGA_SUBTYPE	EQU 0x0211
 	;    7:0 - The current state-machine state number
 	;   15:8 - Bit-field containing request triggers
 	;  23:16 - Bit-field containing status bits
-	;  31:24 - A counter for use by the state-machine
+	;  31:24 - A counter field (currently unused)
 	;------------------------------------------------------
 	
 	; A mask over R7's idle state bits
@@ -100,9 +110,11 @@ IDLE_SCANNING	EQU 0x06
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	; Request a register read operation to be carried out
-	; when the processor is next in the fetch state.
+	; Request a register read/write operation to be carried
+	; out when the processor is next in the fetch state.
+	; Currently not treated differently
 IDLE_REQ_REG_READ	EQU 0x0100
+IDLE_REQ_REG_WRITE	EQU 0x0200
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
@@ -114,35 +126,63 @@ IDLE_FLAG_REGS_AVAIL	EQU 0x010000
 	; not since been stepped.
 IDLE_FLAG_RESET	EQU 0x020000
 	
+	; Flag indicates that the last bit was just scanned
+	; into the scan-path
+IDLE_FLAG_SCANNED_LAST	EQU 0x040000
+	
+	; Flag indicates that the last bit is now clocked in
+IDLE_FLAG_SCAN_COMPLETE	EQU 0x080000
+	
 	;------------------------------------------------------
-	; Simulation Definitions
+	; RAM Allocation (Addresses of variables/arrays in the
+	; main system RAM)
 	;------------------------------------------------------
 	
-	; Start address of the memory the STUMP uses (in the
+	; Start address of the memory the DUT uses (in the
 	; ARM address space
 MEMORY_START	EQU 0x00000000
-	; STUMP Memory address (16-bit word wise address) mask
+	; DUT Memory address (16-bit word wise address) mask
 MEMORY_MASK	EQU 0xFFFF
 	
-	; Start address of the memory the STUMP registers use
-REGISTERS_START	EQU (MEMORY_MASK<<1) + 1
-	; Start address of scanned registers
-REGISTERS_START_SCAN	EQU REGISTERS_START + 2
-	; Number of registers (8 registers + flags)
-REGISTERS_NUM	EQU 9
+	; Location in ram (just after program memory) to use as
+	; a buffer for incoming FPGA data.
+FPGA_DATA_BUFFER	EQU MEMORY_START + (MEMORY_MASK<<1) + 2
+FPGA_DATA_BUFFER_SIZE	EQU 256
 	
-	; Number of register bits
-REGISTERS_BITS	EQU (7*16) + 4
+	; The current cpu info (for wot_r_u)
+CPU_INFO	EQU FPGA_DATA_BUFFER + FPGA_DATA_BUFFER_SIZE
 	
-	; Number of ticks the timer must reach before changing
-	; a signal in the FPGA
+	; The current register being scanned
+REG_CUR_NUM	EQU CPU_INFO + CPU_INFO_LENGTH
+	
+	; The bit in the register currently being scanned
+REG_CUR_BIT	EQU REG_CUR_NUM + 4
+	
+	; Start address of the register data table (see
+	; REG_DEFAULTS for format).
+REG_START	EQU REG_CUR_BIT + 4
+	
+	;------------------------------------------------------
+	; Register/scan-path constants
+	;------------------------------------------------------
+	
+	; A register has been written to and should be sent
+	; back to the device
+SCAN_DIRTY	EQU 2
+	
+	;------------------------------------------------------
+	; System Control Parameters
+	;------------------------------------------------------
+	
+	; Number of ticks the system timer must reach before
+	; changing a signal in the FPGA
 HOLD_TIME	EQU 0x100
 	
 	;------------------------------------------------------
 	; Komodo Protocol Constants
 	;------------------------------------------------------
 	
-	; Reponse to PINGs ("OK00" as ASCII)
+	; Reponse to PINGs ("OK00" in ASCII)
 PING_RESPONSE	EQU 0x30304B4F
 	
 	; CPU States
@@ -171,10 +211,8 @@ ELEMENT_SIZE_2	EQU 0x1 ; 2 Bytes
 ELEMENT_SIZE_4	EQU 0x2 ; 4 Bytes
 ELEMENT_SIZE_8	EQU 0x3 ; 8 Bytes
 	
-PACKET_LENGTH	EQU 255
-	
 	;------------------------------------------------------
-	; Interface Definitions
+	; FPGA Interface Definitions
 	;------------------------------------------------------
 	
 	; Base address of the FPGA
@@ -184,28 +222,30 @@ FPGA_BASE	EQU 0x30000000
 FPGA_REG_SCAN_CONTROL	EQU 0x00
 FPGA_REG_SCAN_IN	EQU 0x02
 FPGA_REG_SCAN_OUT	EQU 0x04
-FPGA_REG_STUMP_CONTROL	EQU 0x06
-FPGA_REG_STUMP_FETCH	EQU 0x08
-FPGA_REG_STUMP_ADDR	EQU 0x0A
-FPGA_REG_STUMP_RWEN	EQU 0x0C
-FPGA_REG_STUMP_DATA_OUT	EQU 0x0E
-FPGA_REG_STUMP_DATA_IN	EQU 0x10
-FPGA_REG_MAGIC	EQU 0x20
+FPGA_REG_DUT_CONTROL	EQU 0x06
+FPGA_REG_DUT_FETCH	EQU 0x08
+FPGA_REG_DUT_ADDR	EQU 0x0A
+FPGA_REG_DUT_RWEN	EQU 0x0C
+FPGA_REG_DUT_DATA_OUT	EQU 0x0E
+FPGA_REG_DUT_DATA_IN	EQU 0x10
+FPGA_REG_DUT_CPU_TYPE	EQU 0x20
+FPGA_REG_DUT_CPU_SUBTYPE	EQU 0x22
 	
-	; STUMP control bits
-STUMP_CLK	EQU 0x1
-STUMP_RESET	EQU 0x2
+	; FPGA_REG_DUT_CONTROL bits
+DUT_CLK	EQU 0x1
+DUT_RESET	EQU 0x2
 	
-	; Read/write enable bits
-STUMP_RD	EQU 0x1
-STUMP_WR	EQU 0x2
+	; FPGA_REG_DUT_RWEN bits
+DUT_RD	EQU 0x1
+DUT_WR	EQU 0x2
 	
-	; Scanpath control bits
+	; FPGA_REG_SCAN_CONTROL bits
 SCAN_CLK	EQU 0x1
 SCAN_EN	EQU 0x2
 	
-	; The magic number returned by FPGA_REG_MAGIC
-MAGIC_NUMBER	EQU 0xDEB6
+	;------------------------------------------------------
+	; FPGA Loading Definitions
+	;------------------------------------------------------
 	
 	; FPGA Pins
 FPGA_INIT_B	EQU 0x00040000
@@ -219,13 +259,13 @@ FPGA_BUS_SHIFT	EQU 23
 FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
 	
 	
+	;------------------------------------------------------
+	; IO Peripheral Definitions
+	;------------------------------------------------------
+	
 	; The LEDs & Buttons
 LED_BUS_SHIFT	EQU 23
 BUTTON_BUS_SHIFT	EQU 4
-	
-	; Location in ram (just after program memory) to use as
-	; a buffer for incoming FPGA data.
-FPGA_DATA_BUFFER	EQU (REGISTERS_START + (REGISTERS_NUM * 2))
 	
 	
 	;------------------------------------------------------
@@ -237,12 +277,10 @@ FPGA_DATA_BUFFER	EQU (REGISTERS_START + (REGISTERS_NUM * 2))
 	
 	B main
 	
-	; Pack version & date into 32 bits
-Version_ID	DCD maker*&1000000 + version*&10000 + day*&800 + month*&80 + year
 	; String describing the program
-	DCB "FPGA CPU Debugger "
-	DCB "Jonathan Heathcote, (c) University of Manchester "
-	DCB "August 2012"
+	DCB "FPGA CPU Debugger Host "
+	DCB "Jonathan Heathcote, University of Manchester "
+	DCB "(c) August 2012"
 	
 	ALIGN
 	
@@ -250,12 +288,15 @@ Version_ID	DCD maker*&1000000 + version*&10000 + day*&800 + month*&80 + year
 	; Data
 	;------------------------------------------------------
 	
-CPU_INFO	; Length of info
-	DCW CPU_INFO_END-CPU_INFO_BODY
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Komodo CPU info-string
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+DEFAULT_CPU_INFO	; Length of info
+	DCW DEFAULT_CPU_INFO_END - DEFAULT_CPU_INFO_BODY
 	
-	; CPU type information
-CPU_INFO_BODY	DCB CPU_TYPE
-	DCW CPU_SUBTYPE
+DEFAULT_CPU_INFO_BODY	; CPU type information
+DEFAULT_CPU_INFO_TYPE_B	DCB CPU_TYPE_UNKNOWN
+DEFAULT_CPU_INFO_SUBTYPE_H	DCW CPU_SUBTYPE_UNKNOWN
 	
 	; One feature: a Spartan-3 FPGA
 	DCB 1
@@ -266,7 +307,34 @@ CPU_INFO_BODY	DCB CPU_TYPE
 	DCB 1
 	DCD 0
 	DCD (MEMORY_MASK+1)
-CPU_INFO_END
+DEFAULT_CPU_INFO_END
+	
+	; Useful values/offsets
+CPU_INFO_LENGTH	EQU DEFAULT_CPU_INFO_END - DEFAULT_CPU_INFO
+CPU_INFO_CPU_TYPE	EQU DEFAULT_CPU_INFO_TYPE_B - DEFAULT_CPU_INFO
+CPU_INFO_CPU_SUBTYPE	EQU DEFAULT_CPU_INFO_SUBTYPE_H - DEFAULT_CPU_INFO
+	
+	ALIGN
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Default scan-path/registers
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; List of registers
+	;    +-----+----------- Register value (16-bits)
+	;    |     |     +----- Register Width (bits)
+	;    |     |     |   +- Dirty flag
+	;    |     |     |   |
+REG_DEFAULTS	DCB 0x00, 0x00, 16, 0x00 ; R0
+	DCB 0x00, 0x00, 16, 0x00 ; R1
+	DCB 0x00, 0x00, 16, 0x00 ; R2
+	DCB 0x00, 0x00, 16, 0x00 ; R3
+	DCB 0x00, 0x00, 16, 0x00 ; R4
+	DCB 0x00, 0x00, 16, 0x00 ; R5
+	DCB 0x00, 0x00, 16, 0x00 ; R6
+	DCB 0x00, 0x00, 16, 0x00 ; R7/PC
+	DCB 0x00, 0x00,  4, 0x00 ; CC
+	DCD 0x00000000;            NULL to terminate list
 	
 	ALIGN
 	
@@ -354,8 +422,31 @@ main	; Set the default MMU translation table from ROM
 	MOVX R11, #USART_BASE
 	MOVX R12, #FPGA_BASE
 	
-	; Clear the STUMP registers
-	BL zero_registers
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Load the device info into RAM (for wot_r_u)
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	ADR  R0, DEFAULT_CPU_INFO
+	ADR  R1, DEFAULT_CPU_INFO_END
+	MOVX R2, #CPU_INFO
+	
+0	LDRB  R3, [R0], #1
+	STRB  R3, [R2], #1
+	; Loop until we reach the end
+	CMP  R0, R1
+	BNE  %b0
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Load the default register table/scan-path
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	ADR  R0, REG_DEFAULTS
+	MOVX R1, #REG_START
+0	LDR  R2, [R0], #4
+	STR  R2, [R1], #4
+	; Loop until reach a NULL
+	CMP  R2, #0
+	BNE  %b0
 	
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -370,9 +461,6 @@ main_loop	; Handle incoming commands
 	
 	; Loop-de-loop!
 	B  main_loop
-	
-	; Shouldn't get here!
-	B .
 	
 	
 	
@@ -701,53 +789,57 @@ led_write	STMFD SP!, {R0, LR}
 	;------------------------------------------------------
 register_read	STMFD SP!, {LR}
 	
-	; Check if register values are up-to-date
-	TST R7, #IDLE_FLAG_REGS_AVAIL
-	BNE register_read_go
-	
-	; Request an update of the registers
+	; Set the flag ensuring registers are kept up-to-date
 	ORR R7, R7, #IDLE_REQ_REG_READ
-0	BL  idle_process
 	
-	; XXX: Uncomment the next two lines to ensure the
-	; registers get updated before reading their values.
-	; This causes pretty massive delays at the cost of
-	; always retrieving correct values. Assuming that these
-	; values are polled, occasional glitches in the form of
-	; seeing half-written values, shouldn't be a problem.
-	;TST R7, #IDLE_FLAG_REGS_AVAIL
-	;BEQ %b0
+	; Get the start address of the register memory
+	MOVX LR, #REG_START
 	
-	
-	; Do nothing if out of range
-register_read_go	CMP R2, #REGISTERS_NUM
-	BHS %f0
-	
-	; Calculate offset (register addresses are for
-	; half-words)
-	MOVX LR, #REGISTERS_START
-	ADD  LR, LR, R2, LSL #1
+	; Calculate offset into the list of registers
+	ADD  LR, LR, R2, LSL #2
 	
 	; Load the register's value
 	LDRH  R0, [LR]
 	
-0	LDMFD SP!, {PC}
+	LDMFD SP!, {PC}
 	
 	
 	;------------------------------------------------------
 	; Write to a register in the CPU.
-	; TODO: Add register write support.
 	;
 	; Argument:
 	;   R0: Value
 	;   R2: Register 'Address'
 	;------------------------------------------------------
-register_write	; XXX: Not implemented!
-	MOV PC, LR
+register_write	STMFD SP!, {R0-R1, LR}
+	
+	; Set the flag ensuring registers are kept up-to-date
+	ORR R7, R7, #IDLE_REQ_REG_WRITE
+	
+	; Get the start address of the register memory
+	MOVX LR, #REG_START
+	
+	; Calculate offset into the list of registers
+	ADD  LR, LR, R2, LSL #2
+	
+	; If trying to write to the terminating zero register
+	; in the table, fail.
+	LDR R0, [LR]
+	CMP R0, #0
+	BEQ %f0
+	
+	; Store the register's new value
+	STRH  R0, [LR]
+	
+	; Set the dirty flag
+	MOV  R0, #SCAN_DIRTY
+	STRB R0, [LR, #3]
+	
+0	LDMFD SP!, {R0-R1, PC}
 	
 	
 	;------------------------------------------------------
-	; Read and execute a command
+	; Read and execute a command from the host computer
 	;------------------------------------------------------
 handle_command	STMFD SP!, {R0-R3, LR}
 	
@@ -831,8 +923,8 @@ cmd_ping	MOVX R0, #PING_RESPONSE
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Get CPU Info
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_wot_r_u	ADR  R1, CPU_INFO
-	MOVX R2, #(CPU_INFO_END - CPU_INFO)
+cmd_wot_r_u	MOVX R1, #CPU_INFO
+	MOVX R2, #CPU_INFO_LENGTH
 	BL   serial_write_data
 	B    handle_command_return
 	
@@ -1249,10 +1341,10 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	LDMFD SP!, {R1-R2, PC}
 	
 	;-----------------------------------------------------
-	; Send some data into the FPGA
+	; Load some data (from a bit file) into the FPGA
 	;
 	; Arguments:
-	;   R1: Address of data
+	;   R1: Start-address of data in memory
 	;   R2: Number of bytes
 	;
 	; Returns:
@@ -1310,20 +1402,35 @@ fpga_send_return	; CCLK low
 	
 	
 	;-----------------------------------------------------
-	; Idle process which should be executed whenever the
-	; system is blocked for some reason.
+	; Idle process which should be executed on a frequent
+	; basis. Good times are while blocking on IO and each
+	; iteration of a mainloop. This call does not block.
 	;
 	; Contains a state machine which clocks the CPU,
 	; scans-out register values and emulates memory for the
 	; CPU running in the FPGA.
+	;
+	; A system timer is used to check when suitable delays
+	; have occurred between signals being produced (for
+	; example a clock signal).
 	;-----------------------------------------------------
 idle_process	STMFD SP!, {R1-R2, LR}
 	
-	; Check the FPGA is programmed
-	LDRH  LR, [R12, #FPGA_REG_MAGIC]
-	MOVX  R1, #MAGIC_NUMBER
-	CMP   LR, R1
-	BEQ   %f0
+	; Get the CPU (sub)type in the CPU_INFO
+	LDRH  R1, [R12, #FPGA_REG_DUT_CPU_TYPE]
+	LDRH  R2, [R12, #FPGA_REG_DUT_CPU_SUBTYPE]
+	
+	; Store the values
+	MOVX  LR, #CPU_INFO
+	STRB  R1, [LR, #CPU_INFO_CPU_TYPE]
+	STRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE]
+	MOV   R2, R2, LSR #8
+	STRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE+1]
+	
+	; Check that the FPGA isn't unconfigured (i.e. returning all 1s)
+	MOVX  R2, #0xFFFF
+	CMP   R1, R2
+	BNE   %f0
 	
 	; If not programmed, set state to busy and give up.
 	MOV R8, #STATE_BUSY
@@ -1354,14 +1461,14 @@ idle_process	STMFD SP!, {R1-R2, LR}
 	; device. This means reset it.
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 idle_start	; Reset the CPU
-	MOV  LR, #STUMP_RESET
-	STRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
+	MOV  LR, #DUT_RESET
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 	; Make sure the scan-path is off
 	MOV  LR, #0
 	STRH LR, [R12, #FPGA_REG_SCAN_CONTROL]
 	
-	; Zero-out the STUMP registers
+	; Zero-out the DUT's registers
 	BL zero_registers
 	
 	; Update state
@@ -1385,13 +1492,13 @@ idle_resetting	; If the timer hasn't expired, wait.
 	BLT idle_process_return
 	
 	; Is the reset signal still high
-	LDRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
-	TST  LR, #STUMP_RESET
+	LDRH LR, [R12, #FPGA_REG_DUT_CONTROL]
+	TST  LR, #DUT_RESET
 	BEQ  %f0
 	
 	; Reset signal is still high, clear it
 	MOV  LR, #0
-	STRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	BL   reset_timer
 	B    idle_process_return
 	
@@ -1408,7 +1515,7 @@ idle_resetting	; If the timer hasn't expired, wait.
 	; initialised and reset. Look for things to do.
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 idle_normal	; Are the register values are being requested?
-	TST R7, #IDLE_REQ_REG_READ
+	TST R7, #(IDLE_REQ_REG_READ|IDLE_REQ_REG_WRITE)
 	BEQ %f0
 	
 	; If we're freshly reset or in a fetch state (you
@@ -1416,7 +1523,7 @@ idle_normal	; Are the register values are being requested?
 	; coded defensively...).
 	TST  R7, #IDLE_FLAG_RESET
 	BNE  idle_normal_do_scan
-	LDRH LR, [R12, #FPGA_REG_STUMP_FETCH]
+	LDRH LR, [R12, #FPGA_REG_DUT_FETCH]
 	CMP  LR, #1
 	BNE  %f0
 	
@@ -1428,14 +1535,8 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 	STRH LR, [R12, #FPGA_REG_SCAN_CONTROL]
 	BL   reset_timer
 	
-	; Reset the counter
-	BIC R7, R7, #IDLE_COUNT_MASK
-	MOV LR, #REGISTERS_BITS
-	ORR R7, R7, LR, LSL #IDLE_COUNT_SHIFT
-	
 	; Enter the scan initialisation state and clear the
-	; request
-	BIC R7, R7, #IDLE_REQ_REG_READ
+	; request and flags.
 	BIC R7, R7, #IDLE_STATE_MASK
 	ORR R7, R7, #IDLE_SCAN_INIT
 	B   idle_process_return
@@ -1467,8 +1568,8 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 	BNE  %f0
 	TST  R7, #IDLE_FLAG_RESET
 	BNE  %f0
-	MOV  LR, #STUMP_RESET
-	STRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
+	MOV  LR, #DUT_RESET
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 	; Enter the reset state and invalidate fetched register
 	; values
@@ -1492,8 +1593,8 @@ idle_clock_init	; Has the timer expired?
 	BLT idle_process_return
 	
 	; Set the clock high
-	MOV  LR, #STUMP_CLK
-	STRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
+	MOV  LR, #DUT_CLK
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 1	; Start clocking normally
 	BIC R7, R7, #IDLE_STATE_MASK
@@ -1511,13 +1612,13 @@ idle_clock	; Has the timer expired?
 	BLT idle_process_return
 	
 	; Timer has expired, check which state the clock is in
-	LDRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
-	TST  LR, #STUMP_CLK
+	LDRH LR, [R12, #FPGA_REG_DUT_CONTROL]
+	TST  LR, #DUT_CLK
 	BEQ  idle_clock_low
 	
 	; The clock is high, clear it
-	BIC  LR, LR, #STUMP_CLK
-	STRH LR, [R12, #FPGA_REG_STUMP_CONTROL]
+	BIC  LR, LR, #DUT_CLK
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 	; Do any memory accesses the CPU is requesting (at the
 	; negative edge of the clock)
@@ -1530,7 +1631,7 @@ idle_clock	; Has the timer expired?
 idle_clock_low	; The clock is low so we've now finished cycling it
 	; Check to see if the CPU is now in the fetch state
 	; (i.e. a step has completed)
-	LDRH LR, [R12, #FPGA_REG_STUMP_FETCH]
+	LDRH LR, [R12, #FPGA_REG_DUT_FETCH]
 	TST  LR, #1
 	BEQ  %f1
 	
@@ -1586,7 +1687,11 @@ idle_scan_init_low	; The clock is low so we've now finished cycling it.
 	
 idle_scan_init_enabled	; The scan path is enabled and the clock low, snatch
 	; the first bit which will now be exposed on scan-out
+	BL   scan_init
 	BL   scan_bit
+	
+	; Set the flag if the last bit was just reached
+	ORREQ R7, R7, #IDLE_FLAG_SCANNED_LAST
 	
 	; Start scanning
 	BIC R7, R7, #IDLE_STATE_MASK
@@ -1613,31 +1718,41 @@ idle_scanning	; Has the timer expired?
 	BIC  LR, LR, #SCAN_CLK
 	STRH LR, [R12, #FPGA_REG_SCAN_CONTROL]
 	
+	; Did we previously scan the last bit? If so we've now
+	; clocked it in so the scan is complete
+	TST   R7, #IDLE_FLAG_SCANNED_LAST
+	ORRNE R7, R7, #IDLE_FLAG_SCAN_COMPLETE
+	BNE   %f0
+	
 	; Snatch the bit on this negative edge
 	BL scan_bit
+	; Set the flag if the last bit was just reached
+	ORREQ R7, R7, #IDLE_FLAG_SCANNED_LAST
 	
 	; Wait again
-	BL reset_timer
+0	BL reset_timer
 	B  idle_process_return
 	
 idle_scanning_low	; The clock is low
 	; Check to see if we're done scanning, if not, start
 	; the next clock.
-	TST R7, #IDLE_COUNT_MASK
-	BNE idle_scanning_next
-	
-	; Finished counting, indicate register values are valid
-	ORR R7, R7, #IDLE_FLAG_REGS_AVAIL
+	TST R7, #IDLE_FLAG_SCAN_COMPLETE
+	BEQ idle_scanning_next
 	
 	; If the scan path is disabled, we're done, if not,
 	; disable it and wait.
 	TST  LR, #SCAN_EN
 	BNE  %f0
 	
+	; Finished scanning, indicate register values are valid
+	ORR R7, R7, #IDLE_FLAG_REGS_AVAIL
+	
 	; Scan-path already disabled, Return to normal state
+	BIC R7, R7, #(IDLE_REQ_REG_READ|IDLE_REQ_REG_WRITE)
+	BIC R7, R7, #(IDLE_FLAG_SCAN_COMPLETE|IDLE_FLAG_SCANNED_LAST)
 	BIC R7, R7, #IDLE_STATE_MASK
 	ORR R7, R7, #IDLE_NORMAL
-	B idle_process_return
+	B   idle_process_return
 	
 	; Scan-path not disabled, disable it and wait
 0	BIC  LR, LR, #SCAN_EN
@@ -1659,25 +1774,30 @@ idle_process_return	LDMFD SP!, {R1-R2, PC}
 	
 	
 	;-----------------------------------------------------
-	; Reset the stump registers to zero.
+	; Reset the registers in the register table to
+	; zero/clean.
 	;-----------------------------------------------------
-zero_registers	STMFD SP!, {R0,R2, LR}
+zero_registers	STMFD SP!, {R0,R1, LR}
 	
-	MOVX R0, #0
-	MOVX LR, #REGISTERS_START
-	MOVX R2, #REGISTERS_NUM
+	; A mask of all non register-width fields
+	MVN  R0, #0x00FF0000
 	
-	; Run through the register slots backwards and reset
-	; them
-0	SUBS R2, R2, #1
-	STR  R0, [LR, R2, LSL #1]
-	BNE  %b0
+	; The register table address
+	MOVX LR, #REG_START
 	
-	LDMFD SP!, {R0,R2, PC}
+	; Zero out the value & dirty flag
+0	LDR  R1, [LR]
+	BICS R1, R1, R0
+	STR  R1, [LR], #4
+	; If only zeros remain we've reached the last (null)
+	; element indicating the end of the table so stop
+	BNE %b0
+	
+	LDMFD SP!, {R0,R1, PC}
 	
 	
 	;-----------------------------------------------------
-	; Reset the timer
+	; Reset the system timer
 	;-----------------------------------------------------
 reset_timer	STMFD SP!, {R0, LR}
 	
@@ -1690,8 +1810,9 @@ reset_timer	STMFD SP!, {R0, LR}
 	
 	
 	;-----------------------------------------------------
-	; Has the hold time elapsed? Sets the flags such that
-	; GE if the hold time has elapsed and LT if not.
+	; Has the hold time elapsed since the system timer was
+	; elapsed? Sets the flags such that GE if the hold
+	; time has elapsed and LT if not.
 	;-----------------------------------------------------
 hold_time_elapsed	STMFD SP!, {LR}
 	
@@ -1705,30 +1826,32 @@ hold_time_elapsed	STMFD SP!, {LR}
 	
 	;-----------------------------------------------------
 	; Act on any memory accesses initiated by the attached
-	; CPU
+	; CPU. Reads the address and control buses and responds
+	; by either storing the value on the data bus or
+	; sending out a value on the read bus.
 	;-----------------------------------------------------
 emulate_memory	STMFD SP!, {R0, R2, LR}
 	
 	; Read or write?
-	LDRH LR, [R12, #FPGA_REG_STUMP_RWEN]
-	TST  LR, #STUMP_RD
+	LDRH LR, [R12, #FPGA_REG_DUT_RWEN]
+	TST  LR, #DUT_RD
 	BNE  emulate_read
-	TST  LR, #STUMP_WR
+	TST  LR, #DUT_WR
 	BNE  emulate_write
 	B    emulate_memory_return
 	
 emulate_write	; Get the address requested and the data and then store
 	; it into memory.
-	LDRH R2, [R12, #FPGA_REG_STUMP_ADDR]
-	LDRH R0, [R12, #FPGA_REG_STUMP_DATA_OUT]
+	LDRH R2, [R12, #FPGA_REG_DUT_ADDR]
+	LDRH R0, [R12, #FPGA_REG_DUT_DATA_OUT]
 	BL   memory_write
 	B    emulate_memory_return
 	
 emulate_read	; Get the address requested, do the read and send the
 	; result to the device.
-	LDRH R2, [R12, #FPGA_REG_STUMP_ADDR]
+	LDRH R2, [R12, #FPGA_REG_DUT_ADDR]
 	BL   memory_read
-	STRH R0, [R12, #FPGA_REG_STUMP_DATA_IN]
+	STRH R0, [R12, #FPGA_REG_DUT_DATA_IN]
 	; Fall through to return
 	
 	
@@ -1736,41 +1859,102 @@ emulate_memory_return	LDMFD SP!, {R0, R2, PC}
 	
 	
 	;-----------------------------------------------------
-	; Load a scanned bit into registers
+	; Reset the counters used by scan_bit. Call this prior
+	; to scanning data through the system.
+	;-----------------------------------------------------
+scan_init	STMFD SP!, {R0, LR}
+	
+	; Reset the counters
+	MOV  R0, #0
+	MOVX LR, #REG_CUR_NUM
+	STR  R0, [LR]
+	STR  R0, [LR, #4]
+	
+	LDMFD SP!, {R0, PC}
+	
+	
+	;-----------------------------------------------------
+	; Put the most recently scanned bit into a register
+	; and either send it back into the scan path or send in
+	; a new value if overwriting the register.
+	;
+	; Sets the flags. EQ if this is the last bit, NE
+	; otherwise.
 	;-----------------------------------------------------
 scan_bit	STMFD SP!, {R0-R3, LR}
 	
-	; Advance the bit counter
-	MOV R2, R7, LSR #IDLE_COUNT_SHIFT
-	SUB R2, R2, #1
-	BIC R7, R7, #IDLE_COUNT_MASK
-	ORR R7, R7, R2, LSL #IDLE_COUNT_SHIFT
+	; Get the current register/current bit
+	MOVX LR, #REG_CUR_NUM
+	LDR  R0, [LR]
+	LDR  R1, [LR, #4]
+	
+	; Get the address of the register in the register
+	; table
+	MOVX LR, #REG_START
+	ADD  LR, LR, R0, LSL #2
+	
+	; Load the register table entry
+	LDRH R2, [LR]
+	
+	; Is the register dirty (i.e. to be written back?)
+	LDRB R3, [LR, #3]
+	TST R3, #SCAN_DIRTY<<16
+	BNE scan_bit_dirty
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; This bit is clean, clear it and set it from the
+	; scanpath
+	MOV  R3, #1
+	BIC  R2, R2, R3, LSL R1
+	LDRH R3, [R12, #FPGA_REG_SCAN_OUT]
+	ORR  R2, R2, R3, LSL R1
+	
+	; Set the value in the register table
+	STRH R2, [LR]
 	
 	; Stuff the bit coming out of the scan path back in
-	LDRH LR, [R12, #FPGA_REG_SCAN_OUT]
-	STRH LR, [R12, #FPGA_REG_SCAN_IN]
+	STRH R3, [R12, #FPGA_REG_SCAN_IN]
 	
-	; Also stuff the bit in the required register slot
-	; The register the bit belongs to is bit_num/16
-	MOV R1, R2, LSR #4
-	; Get the register's offset
-	MOV  R1, R1, LSL #1
-	; Get the register's address in memory
-	MOVX R3, #REGISTERS_START_SCAN
-	ADD  R1, R1, R3
+	B scan_bit_return
 	
-	; The bit in the register is bit_num%16
-	AND R2, R2, #0xF
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	; A bit to use for clearing
-	MOV R3, #1
+scan_bit_dirty	; This bit is dirty, send it to the scanpath
+	MOV  R2, R2, LSR R1
+	AND  R2, R2, #1
+	STRH R3, [R12, #FPGA_REG_SCAN_IN]
 	
-	; Get the register's current value
-	LDRH R0, [R1]
-	; Update the bit
-	BIC  R0, R0, R3, LSL R2
-	ORR  R0, R0, LR, LSL R2
-	; Write it back
-	STRH R0, [R1]
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+scan_bit_return	; Increment the bit counter
+	ADD R1, R1, #1
+	
+	; Check it isn't past the end of the field's length
+	LDRB  R2, [LR, #2]
+	CMP   R1, R2
+	BLT   %f0
+	
+	; If it is, wrap around to next register
+	MOV  R1, #0
+	ADD  R0, R0, #1
+	; And clear the dirty flag
+	STRB R1, [LR, #3]
+	
+	; Set the flags depending on whether the next register
+	; has any bits (if its 0 then we just scanned the last
+	; bit
+	LDRB R2, [LR, #4+2]
+	CMP  R2, #0
+	B %f1
+	
+0	; Set the flags indicating there are still more bits to
+	; scan
+	CMP R1, #0 ; Just anything that says != 0
+	
+	; Store the current register/current bit
+1	MOVX LR, #REG_CUR_NUM
+	STR  R0, [LR]
+	STR  R1, [LR, #4]
 	
 	LDMFD SP!, {R0-R3, PC}
