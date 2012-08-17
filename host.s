@@ -47,13 +47,21 @@ USART_BASE	EQU USART1_BASE
 CPU_TYPE_UNKNOWN	EQU 0xFF
 CPU_TYPE_STUMP	EQU 3
 CPU_TYPE_MU0	EQU 4
-CPU_SUBTYPE_UNKNOWN	EQU 0xFFFF
+CPU_SUBTYPE_UNKNOWN	EQU 0x00FF
 CPU_SUBTYPE_REG_AND_MEM	EQU 0x0000
 CPU_SUBTYPE_MEMORY_ONLY	EQU 0x0001
 	
 	; The FPGA (feature) type
 FPGA_TYPE	EQU 0x14
 FPGA_SUBTYPE	EQU 0x0211
+	
+	; The Controller (feature) type
+CONTROLLER_TYPE	EQU 0x01
+CONTROLLER_SUBTYPE	EQU 0x0000
+	
+	; Feature numbers
+FPGA_FEATURE	EQU 0
+CONTROLLER_FEATURE	EQU 1
 	
 	;------------------------------------------------------
 	; Idle-process global state register constants
@@ -62,7 +70,7 @@ FPGA_SUBTYPE	EQU 0x0211
 	;    7:0 - The current state-machine state number
 	;   15:8 - Bit-field containing request triggers
 	;  23:16 - Bit-field containing status bits
-	;  31:24 - A counter field (currently unused)
+	;  31:24 - A counter field (clocks since fetch)
 	;------------------------------------------------------
 	
 	; A mask over R7's idle state bits
@@ -115,6 +123,9 @@ IDLE_SCANNING	EQU 0x06
 	; Currently not treated differently
 IDLE_REQ_REG_READ	EQU 0x0100
 IDLE_REQ_REG_WRITE	EQU 0x0200
+	
+	; Request a single clock pulse be issued
+IDLE_REQ_CLOCK	EQU 0x0400
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
@@ -298,10 +309,13 @@ DEFAULT_CPU_INFO_BODY	; CPU type information
 DEFAULT_CPU_INFO_TYPE_B	DCB CPU_TYPE_UNKNOWN
 DEFAULT_CPU_INFO_SUBTYPE_H	DCW CPU_SUBTYPE_UNKNOWN
 	
-	; One feature: a Spartan-3 FPGA
-	DCB 1
+	; Two features: a Spartan-3 FPGA & a controller
+	; interface to allow manual clocking
+	DCB 2
 	DCB FPGA_TYPE
 	DCW FPGA_SUBTYPE
+	DCB CONTROLLER_TYPE
+	DCW CONTROLLER_SUBTYPE
 	
 	; One memory segment
 	DCB 1
@@ -717,6 +731,7 @@ led_read	; Read the state and shift/mask
 	;   R0: Button states
 	;------------------------------------------------------
 button_read	; Read the state, invert to active high and shift/mask
+	; XXX: Broken?
 	MOVX R0, #PIOC
 	LDR  R0, [R0, #PIO_PDSR]
 	MVN  R0, R0, LSR #BUTTON_BUS_SHIFT
@@ -892,7 +907,7 @@ cmd_jmp_table	B cmd_nop         ; 0x00
 	B cmd_fr_get      ; 0x10 Feature get status
 	B cmd_fr_set      ; 0x11 Feature set status
 	B cmd_nop;cmd_fr_write    ; 0x12 Feature send message
-	B cmd_nop;cmd_fr_read     ; 0x13 Feature get message
+	B cmd_fr_read     ; 0x13 Feature get message
 	B cmd_fr_file     ; 0x14 Feature download header
 	B cmd_fr_send     ; 0x15 Feature download data
 	B cmd_nop         ; 0x16
@@ -949,7 +964,31 @@ cmd_reset	; Does nothing if busy
 cmd_fr_get	; Read feature number
 	BL serial_read
 	
-	; Always return 0
+	CMP R0, #FPGA_FEATURE
+	BEQ cmd_fr_get_fpga
+	
+	; Controller state:
+	;   7:0 -- Clocks since last fetch
+	;     8 -- Read enable
+	;     9 -- Write enable
+	;    10 -- Fetch
+	; 31:11 -- Unused
+	
+	; Clocks since last fetch
+	MOV  R0, R7, LSR #IDLE_COUNT_SHIFT
+	; Read/write enable
+	LDRH R1, [R12, #FPGA_REG_DUT_RWEN]
+	ORR  R0, R0, R1, LSL #8
+	; Fetch
+	LDRH R1, [R12, #FPGA_REG_DUT_FETCH]
+	ORR  R0, R0, R1, LSL #10
+	
+	BL serial_write_word
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+cmd_fr_get_fpga	; FPGA state: Always return 0
 	MOV R0, #0
 	BL  serial_write_word
 	
@@ -962,8 +1001,63 @@ cmd_fr_get	; Read feature number
 cmd_fr_set	; Read feature number
 	BL serial_read
 	
-	; Ignore value recieved
+	CMP R0, #FPGA_FEATURE
+	BEQ cmd_fr_set_fpga
+	
+	; If we get any new status sent to the controller,
+	; that means clock the CPU!
 	BL serial_read_word
+	
+	; Does nothing if busy
+	CMP R8,  #STATE_BUSY
+	BEQ handle_command_return
+	; Stop the CPU
+	MOV R8, #STATE_STOPPED
+	; Request it be clocked
+	ORR R7, R7, #IDLE_REQ_CLOCK
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+cmd_fr_set_fpga	; Ignore value recieved
+	BL serial_read_word
+	
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Feature get message
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+cmd_fr_read	; Read feature number
+	BL serial_read
+	
+	CMP R0, #FPGA_FEATURE
+	BEQ cmd_fr_read_nop
+	
+	; Assume we're requesting the memory address and data
+	; (2*3 bytes). If not, return nothing.
+	BL serial_read
+	CMP R0, #(2*3)
+	BNE cmd_fr_read_nothing
+	
+	; We're about to return that many bytes
+	BL serial_write
+	
+	; Memory address
+	LDRH R0, [R12, #FPGA_REG_DUT_ADDR]
+	BL   serial_write_half
+	LDRH R0, [R12, #FPGA_REG_DUT_DATA_IN]
+	BL   serial_write_half
+	LDRH R0, [R12, #FPGA_REG_DUT_DATA_OUT]
+	BL   serial_write_half
+	
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+cmd_fr_read_nop	; Ignore request, return nothing
+	BL serial_read
+cmd_fr_read_nothing	MOV R0, #0
+	BL serial_write
 	
 	B handle_command_return
 	
@@ -977,9 +1071,18 @@ cmd_fr_file	; As we're downloading a CPU, set it as busy as nothing can
 	; Read feature number
 	BL serial_read
 	
+	CMP R0, #FPGA_FEATURE
+	BEQ cmd_fr_file_fpga
+	
+	; Controller feature
+	; XXX TODO
+	B handle_command_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
 	; Get size of file and use R10 to store it as a CPU is
 	; being loaded so this register isn't used
-	BL  serial_read_word
+cmd_fr_file_fpga	BL  serial_read_word
 	MOV R10, R0
 	
 	; Initialise the FPGA
@@ -1416,16 +1519,15 @@ fpga_send_return	; CCLK low
 	;-----------------------------------------------------
 idle_process	STMFD SP!, {R1-R2, LR}
 	
-	; Get the CPU (sub)type in the CPU_INFO
+	; Get the CPU (sub)type
 	LDRH  R1, [R12, #FPGA_REG_DUT_CPU_TYPE]
 	LDRH  R2, [R12, #FPGA_REG_DUT_CPU_SUBTYPE]
 	
-	; Store the values
+	; Set the given CPU type and the bottom-byte of
+	; the subtype as the system's current type/subtype
 	MOVX  LR, #CPU_INFO
 	STRB  R1, [LR, #CPU_INFO_CPU_TYPE]
 	STRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE]
-	MOV   R2, R2, LSR #8
-	STRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE+1]
 	
 	; Check that the FPGA isn't unconfigured (i.e. returning all 1s)
 	MOVX  R2, #0xFFFF
@@ -1476,7 +1578,9 @@ idle_start	; Reset the CPU
 	MOV R9,  #0 ; Steps executed
 	MOV R10, #0 ; Steps remaining
 	
-	; Start the idle process in the resetting state
+	; Start the idle process in the resetting state with
+	; the cycle counter zeroed out
+	BIC R7, R7, #IDLE_COUNT_MASK
 	BIC R7, R7, #IDLE_STATE_MASK
 	ORR R7, R7, #IDLE_RESETTING
 	BL  reset_timer
@@ -1518,16 +1622,7 @@ idle_normal	; Are the register values are being requested?
 	TST R7, #(IDLE_REQ_REG_READ|IDLE_REQ_REG_WRITE)
 	BEQ %f0
 	
-	; If we're freshly reset or in a fetch state (you
-	; should be in a fetch state after a reset but this is
-	; coded defensively...).
-	TST  R7, #IDLE_FLAG_RESET
-	BNE  idle_normal_do_scan
-	LDRH LR, [R12, #FPGA_REG_DUT_FETCH]
-	CMP  LR, #1
-	BNE  %f0
-	
-	; We're in a fetch state so lets scan the values out
+	; Scan the values out!
 	; Send a clock pulse to the scanpath while it is
 	; disabled to cause the scan-registers to sample the
 	; register values.
@@ -1543,19 +1638,23 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-0	; If processor is now running, clock it!
+0	; If a clock pulse has been requested, clock it!
+	TST R7, #IDLE_REQ_CLOCK
+	BNE %f1
+	; If processor is running, also clock it!
 	CMP  R8, #STATE_RUNNING
 	BNE  %f0
 	
-	; Update the memory interface
+1	; Update the memory interface
 	BL emulate_memory
 	
-	BL   reset_timer
+	BL reset_timer
 	
-	; Enter the clocking init state, invalidate fetched
-	; register values, and note that we're not reset
-	; anymore.
-	BIC R7, R7, #(IDLE_FLAG_REGS_AVAIL | IDLE_FLAG_RESET)
+	; Enter the clocking init state, clearing the clock
+	; request, invalidate fetched register values, and
+	; note that we're not reset anymore.
+	BIC R7, R7, #IDLE_REQ_CLOCK
+	BIC R7, R7, #IDLE_FLAG_REGS_AVAIL | IDLE_FLAG_RESET
 	BIC R7, R7, #IDLE_STATE_MASK
 	ORR R7, R7, #IDLE_CLOCK_INIT
 	B   idle_process_return
@@ -1572,13 +1671,18 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 	; Enter the reset state and invalidate fetched register
-	; values
+	; values and clear the cycle count
+	BIC R7, R7, #IDLE_COUNT_MASK
 	BIC R7, R7, #IDLE_FLAG_REGS_AVAIL
 	BIC R7, R7, #IDLE_STATE_MASK
 	ORR R7, R7, #IDLE_RESETTING
 	B   idle_process_return
 	
-0	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+0	; Nothing to do, just keep the memory interface
+	; up-to-date.
+	BL emulate_memory
 	
 	B idle_process_return
 	
@@ -1591,6 +1695,17 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 idle_clock_init	; Has the timer expired?
 	BL  hold_time_elapsed
 	BLT idle_process_return
+	
+	; Clear the clock count if the CPU is fetching
+	LDRH  LR, [R12, #FPGA_REG_DUT_FETCH]
+	CMP   LR, #1
+	BICEQ R7, R7, #IDLE_COUNT_MASK
+	
+	; Increment the clock count
+	MOV R1, R7, LSR #IDLE_COUNT_SHIFT
+	ADD R1, R1, #1
+	BIC R7, R7, #IDLE_COUNT_MASK
+	ORR R7, R7, R1, LSL #IDLE_COUNT_SHIFT
 	
 	; Set the clock high
 	MOV  LR, #DUT_CLK
