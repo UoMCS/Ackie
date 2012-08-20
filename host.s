@@ -47,9 +47,10 @@ USART_BASE	EQU USART1_BASE
 CPU_TYPE_UNKNOWN	EQU 0xFF
 CPU_TYPE_STUMP	EQU 3
 CPU_TYPE_MU0	EQU 4
-CPU_SUBTYPE_UNKNOWN	EQU 0x00FF
-CPU_SUBTYPE_REG_AND_MEM	EQU 0x0000
-CPU_SUBTYPE_MEMORY_ONLY	EQU 0x0001
+	; The CPU sub-type (only regard the LSB)
+CPU_SUBTYPE_UNKNOWN	EQU 0xFF
+CPU_SUBTYPE_REG_AND_MEM	EQU 0x00
+CPU_SUBTYPE_MEMORY_ONLY	EQU 0x01
 	
 	; The FPGA (feature) type
 FPGA_TYPE	EQU 0x14
@@ -334,12 +335,51 @@ CPU_INFO_CPU_SUBTYPE	EQU DEFAULT_CPU_INFO_SUBTYPE_H - DEFAULT_CPU_INFO
 	; Default scan-path/registers
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	; List of registers
-	;    +-----+----------- Register value (16-bits)
-	;    |     |     +----- Register Width (bits)
-	;    |     |     |   +- Dirty flag
-	;    |     |     |   |
-REG_DEFAULTS	DCB 0x00, 0x00, 16, 0x00 ; R0
+	; The register table format consists of rows of:
+	;
+	;        +-----+----------- Register value (16-bits)
+	;        |     |     +----- Register Width (bits)
+	;        |     |     |   +- Dirty flag
+	;        |     |     |   |
+	;   DCB 0x00, 0x00, 16, 0x00
+	;
+	; Terminated by a null/zero (32-bit) row
+
+	; Lookup table pointing to compatible architectures
+	; Contains half-word pairs where the first half-word
+	; has the MSB set to the cpu type and and LSB set to
+	; the cpu sub-type's LSB. The second half-word is the
+	; Offset from the start of the table to the register
+	; table listing.
+
+REG_DEFAULTS	; STUMP With Register List
+	DCW (CPU_TYPE_STUMP<<8) | CPU_SUBTYPE_REG_AND_MEM
+	DCW REG_DEFAULTS_STUMP - REG_DEFAULTS
+	
+	; STUMP Without Register List
+	DCW (CPU_TYPE_STUMP<<8) | CPU_SUBTYPE_MEMORY_ONLY
+	DCW REG_DEFAULTS_EMPTY - REG_DEFAULTS
+
+	; MU0 With Register List
+	DCW (CPU_TYPE_MU0<<8) | CPU_SUBTYPE_REG_AND_MEM
+	DCW REG_DEFAULTS_MU0 - REG_DEFAULTS
+	
+	; MU0 Without Register List
+	DCW (CPU_TYPE_MU0<<8) | CPU_SUBTYPE_MEMORY_ONLY
+	DCW REG_DEFAULTS_EMPTY - REG_DEFAULTS
+	
+	; End of list (note that this prevents us supporting
+	; ARMs with CPU-id 00/0000 but that wasn't going to be
+	; possible anyway since everything is 16-bit).
+	DCD 0x00000000
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; An empty register list
+REG_DEFAULTS_EMPTY	DCD 0x00000000 ; Null terminate list
+	
+	; Stump registers
+REG_DEFAULTS_STUMP	DCB 0x00, 0x00, 16, 0x00 ; R0
 	DCB 0x00, 0x00, 16, 0x00 ; R1
 	DCB 0x00, 0x00, 16, 0x00 ; R2
 	DCB 0x00, 0x00, 16, 0x00 ; R3
@@ -350,8 +390,13 @@ REG_DEFAULTS	DCB 0x00, 0x00, 16, 0x00 ; R0
 	DCB 0x00, 0x00,  4, 0x00 ; CC
 	DCD 0x00000000;            NULL to terminate list
 	
-	ALIGN
+	; MU0 registers
+REG_DEFAULTS_MU0	DCB 0x00, 0x00, 16, 0x00 ; Accumulator
+	DCB 0x00, 0x00, 12, 0x00 ; Program Counter
+	DCB 0x00, 0x00,  2, 0x00 ; Flags
+	DCD 0x00000000;            NULL to terminate list
 	
+	ALIGN
 	
 	;------------------------------------------------------
 	; Host program system initialisation & mainloop
@@ -440,8 +485,8 @@ main	; Set the default MMU translation table from ROM
 	; Load the device info into RAM (for wot_r_u)
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	ADR  R0, DEFAULT_CPU_INFO
-	ADR  R1, DEFAULT_CPU_INFO_END
+	ADRL R0, DEFAULT_CPU_INFO
+	ADRL R1, DEFAULT_CPU_INFO_END
 	MOVX R2, #CPU_INFO
 	
 0	LDRB  R3, [R0], #1
@@ -451,17 +496,12 @@ main	; Set the default MMU translation table from ROM
 	BNE  %b0
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-	; Load the default register table/scan-path
+	; Load the default (empty) register table/scan-path
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	ADR  R0, REG_DEFAULTS
-	MOVX R1, #REG_START
-0	LDR  R2, [R0], #4
-	STR  R2, [R1], #4
-	; Loop until reach a NULL
-	CMP  R2, #0
-	BNE  %b0
-	
+	BL  get_default_reg_table
+	ADR R0, REG_DEFAULTS_EMPTY
+	BL  load_reg_table
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Mainloop
@@ -853,6 +893,63 @@ register_write	STMFD SP!, {R0-R1, LR}
 0	LDMFD SP!, {R0-R1, PC}
 	
 	
+	;-----------------------------------------------------
+	; Get the address of the register table for the current
+	; architecture. Returns zero if no table was found.
+	;
+	; Returns:
+	;   R0: The address of the table or zero.
+	;   Sets the flags to be EQ if R0 is zero, NE otherwise
+	;-----------------------------------------------------
+get_default_reg_table	STMFD SP!, {R1-R2, LR}
+	
+	; Get the CPU type/LSB-of-subtype into a half-word in
+	; R1
+	MOVX  LR, #CPU_INFO
+	LDRB  R0, [LR, #CPU_INFO_CPU_TYPE]
+	LDRB  R1, [LR, #CPU_INFO_CPU_SUBTYPE]
+	ORR   R1, R1, R0, LSL #8
+	
+	; Search the set of register tables for a suitable
+	; table
+	ADR  LR, REG_DEFAULTS
+	MOV  R2, LR
+0	LDRH R0, [R2], #4
+	CMP  R1, R0
+	BEQ  %f1
+	CMP  R0, #0
+	BNE  %b0
+	; Not found (reached a null terminator), just return
+	; the zero
+	B %f2
+	
+	; Found an entry! Load the offset
+1	LDRH R0, [R2, #-2]
+	; Add it to the table start address and return (setting
+	; the flags)
+	ADDS R0, R0, LR
+	
+2	LDMFD SP!, {R1-R2, PC}
+	
+	
+	;-----------------------------------------------------
+	; Load the stated register table from ROM
+	;
+	; Arguments:
+	;   R0: The table address
+	;-----------------------------------------------------
+load_reg_table	STMFD SP!, {R0-R1, LR}
+	
+	MOVX R1, #REG_START
+0	LDR  LR, [R0], #4
+	STR  LR, [R1], #4
+	; Loop until reach a NULL
+	CMP  LR, #0
+	BNE  %b0
+	
+	LDMFD SP!, {R0-R1, PC}
+	
+	
 	;------------------------------------------------------
 	; Read and execute a command from the host computer
 	;------------------------------------------------------
@@ -1064,25 +1161,55 @@ cmd_fr_read_nothing	MOV R0, #0
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Feature recieve download header
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_fr_file	; As we're downloading a CPU, set it as busy as nothing can
-	; happen to it for now.
-	MOV R8, #STATE_BUSY
-	
-	; Read feature number
+cmd_fr_file	; Read feature number
 	BL serial_read
 	
 	CMP R0, #FPGA_FEATURE
 	BEQ cmd_fr_file_fpga
 	
 	; Controller feature
-	; XXX TODO
+	; Get the number of registers to be recieved
+	BL serial_read_word
+	
+	; Fail if not a multiple of 4 (as registers are
+	; described as 4-byte words as in the register table).
+	TST  R0, #0x3
+	BNE  %f0
+	
+	; Divide by 4 to get number of registers
+	MOV   R0, R0, LSR #2
+	
+	; Set the number of user registers in the CPU subtype
+	MOVX  LR, #CPU_INFO
+	STRB  R0, [LR, #CPU_INFO_CPU_SUBTYPE + 1]
+	
+	; Find out what register table to use (default to the
+	; empty one if none supplied) and Reset the register
+	; table to its defaults
+	BL     get_default_reg_table
+	ADRLEQ R0, REG_DEFAULTS_EMPTY
+	BL     load_reg_table
+	
+	; Return 'A' to confirm OK
+	MOV R0, #'A'
+	BL  serial_write
+	
+	B handle_command_return
+	
+0	; Non multiple of 4 recieved, return an error.
+	MOV R0, #'4'
+	BL  serial_write
 	B handle_command_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
+cmd_fr_file_fpga	; As we're downloading a CPU, set it as busy as nothing can
+	; happen to it for now.
+	MOV R8, #STATE_BUSY
+	
 	; Get size of file and use R10 to store it as a CPU is
 	; being loaded so this register isn't used
-cmd_fr_file_fpga	BL  serial_read_word
+	BL  serial_read_word
 	MOV R10, R0
 	
 	; Initialise the FPGA
@@ -1097,8 +1224,63 @@ cmd_fr_file_fpga	BL  serial_read_word
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Feature recieve download data
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_fr_send	; Read (and ignore) feature number
+cmd_fr_send	; Get the feature number
 	BL serial_read
+	
+	CMP R0, #FPGA_FEATURE
+	BEQ cmd_fr_send_fpga
+	
+	; Getting a controller packet
+	
+	; Read the number of bytes in packet (0 = 256)
+	BL serial_read
+	MOVS  R2, R0
+	MOVEQ R2, #256
+	
+	; Fail if not a multiple of 4
+	TST  R2, #0x3
+	BEQ  %f1
+	; Absorb the data
+0	BL   serial_read
+	SUBS R2, R2, #1
+	BNE  %b0
+	
+	; Return a faliure
+	MOV R0, #'4'
+	BL  serial_write
+	B   handle_command_return
+	
+1	; We have a multiple of four. Stop the current scanner
+	; running if it is (as we are about to clobber the
+	; null terminator it looks for).
+	ORR R7, R7, #IDLE_FLAG_SCANNED_LAST
+	
+	; Find the end of the register table
+	MOVX R1, #REG_START
+0	LDR  R0, [R1], #4
+	; Loop until reach the terminating NULL
+	CMP  R0, #0
+	BNE  %b0
+	
+	; Move the pointer back onto the last entry
+	SUB  R1, R1, #4
+	
+	; Read the data into the table
+	BL serial_read_data
+	
+	; Null terminate the table
+	MOV R0, #0
+	STR R0, [R1, R2]
+	
+	; Return OK!
+	MOV R0, #'A'
+	BL  serial_write
+	B   handle_command_return
+	
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+cmd_fr_send_fpga	; Getting an FPGA Packet
 	
 	; Read the number of bytes in packet (0 = 256)
 	BL serial_read
@@ -1519,23 +1701,39 @@ fpga_send_return	; CCLK low
 	;-----------------------------------------------------
 idle_process	STMFD SP!, {R1-R2, LR}
 	
-	; Get the CPU (sub)type
-	LDRH  R1, [R12, #FPGA_REG_DUT_CPU_TYPE]
-	LDRH  R2, [R12, #FPGA_REG_DUT_CPU_SUBTYPE]
-	
-	; Set the given CPU type and the bottom-byte of
-	; the subtype as the system's current type/subtype
 	MOVX  LR, #CPU_INFO
+	
+	; Update the CPU type (checking if it has changed)
+	LDRH  R1, [R12, #FPGA_REG_DUT_CPU_TYPE]
+	LDRB  R2, [LR, #CPU_INFO_CPU_TYPE]
+	CMP   R1, R2 ; Note if it changed
 	STRB  R1, [LR, #CPU_INFO_CPU_TYPE]
-	STRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE]
 	
-	; Check that the FPGA isn't unconfigured (i.e. returning all 1s)
-	MOVX  R2, #0xFFFF
-	CMP   R1, R2
-	BNE   %f0
+	; Update the CPU sub-type bottom-byte
+	LDRH  R1, [R12, #FPGA_REG_DUT_CPU_SUBTYPE]
+	LDRB  R2, [LR, #CPU_INFO_CPU_SUBTYPE]
+	CMPEQ R1, R2 ; Note if it changed also
+	STRB  R1, [LR, #CPU_INFO_CPU_SUBTYPE]
 	
-	; If not programmed, set state to busy and give up.
-	MOV R8, #STATE_BUSY
+	; Load the register table if the CPU changed and not
+	; unconfigured (unconfigured FPGAs return FFFF on all
+	; outputs and thus set the top 8 bits of the subtype)
+	BEQ    %f1
+	TST    R1, #0xFF00
+	BNE    %f2 ; Don't load table if FPGA not programmed
+	BL     get_default_reg_table
+	ADRLEQ R0, REG_DEFAULTS_EMPTY
+	BL     load_reg_table
+	B      %f0 ; Table loaded, resume idle_process
+	
+	; Check that the FPGA isn't unconfigured (i.e.
+	; returning all 1s for the sub-type field (the top byte
+	; should be zeros))
+1	TST   R1, #0xFF00
+	BEQ   %f0
+	
+	; Not programmed, set state to busy and give up.
+2	MOV R8, #STATE_BUSY
 	; Also set the state to the start state and assert the
 	; registers available flag so that nothing will be
 	; stuck waiting for the registers to become available.
@@ -1553,8 +1751,8 @@ idle_process	STMFD SP!, {R1-R2, LR}
 	B idle_normal
 	B idle_clock_init
 	B idle_clock
-	B idle_scan_init
-	B idle_scanning
+	B idle_process_return ; idle_scan_init
+	B idle_process_return ; idle_scanning
 	; End of table
 	
 	
