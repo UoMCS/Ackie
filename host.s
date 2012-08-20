@@ -1223,6 +1223,9 @@ cmd_fr_file	; Read feature number
 	; described as 4-byte words as in the register table).
 	TST  R0, #0x3
 	BNE  %f0
+	; Fail if more than 255 registers to be sent
+	CMP R0, #255<<2
+	BGT %f0
 	
 	; Divide by 4 to get number of registers
 	MOV   R0, R0, LSR #2
