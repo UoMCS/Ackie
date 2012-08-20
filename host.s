@@ -8,9 +8,57 @@
 	; 16-bit memory-word processor implemented on the
 	; FPGA.
 	;
-	; The program begins execution from 'main'.
+	; The program begins execution from 'main'. It
+	; executes a main-loop which deals with communications
+	; with the host debugger via the KMD comms protocol.
+	; Whenever this process blocks on IO (and also at every
+	; iteration of the main-loop) the idle_process function
+	; is called which is a state-machine which handles
+	; clocking the attached FPGA and scanning out
+	; registers.
 	;
 	; A number of registers are reserved for global use.
+	;
+	; This program, due to its somewhat more dynamic than
+	; usual roles, has a few specific behavrious which
+	; might not be obvious. These are described below.
+	;
+	; The CPU ID/Sub-ID is taken as follows:
+	;   ID: The CPU ID returned by the FPGA at address
+	;       FPGA_REG_DUT_CPU_TYPE. When the FPGA is
+	;       unprogrammed, 0xFFFF is returned from all
+	;       addresses which means that the CPU will be of
+	;       type FF unless it is correclty programmed.
+	;   Sub-ID: The bottom-byte of the sub-id is taken from
+	;           the bottom-byte of the FPGA's address
+	;           FPGA_REG_DUT_CPU_SUBTYPE. Again, this is FF
+	;           if the FPGA is unprogrammed. The top byte
+	;           is ignored. This byte should be one
+	;           of CPU_SUBTYPE_REG_AND_MEM or
+	;           CPU_SUBTYPE_MEMORY_ONLY depending on
+	;           whether a scan-path for the registers in
+	;           the system is provided. The top byte of the
+	;           sub-id is the number of extra user
+	;           registers in the scan path.
+	;
+	; The system features logic which can scan data
+	; into and out of the register banks of the system
+	; running on the FPGA. Because the system registers the
+	; debugger expects to find are pre-defined, the first 9
+	; registers scanned out must be R0-R7 then CC. As a
+	; result, this part of the scan-path is hard-coded in
+	; the table REG_DEFAULTS. Up to 255 additional user
+	; registers of up to 16 bits can be defined by sending
+	; data in the same format as these tables to peripheral
+	; 1.
+	;
+	; Additional control/visibility over the attached CPU
+	; in the form of manual clocking and observability of
+	; the memory interface is provided by peripheral 1.
+	; Reading its state will yield various signals (see
+	; cmd_fr_get) and setting its state to any value will
+	; cause a clock pulse to be sent to the CPU (this pauses
+	; execution if it was running).
 	
 	include header.s
 	include usart.h
@@ -1751,8 +1799,8 @@ idle_process	STMFD SP!, {R1-R2, LR}
 	B idle_normal
 	B idle_clock_init
 	B idle_clock
-	B idle_process_return ; idle_scan_init
-	B idle_process_return ; idle_scanning
+	B idle_scan_init
+	B idle_scanning
 	; End of table
 	
 	
