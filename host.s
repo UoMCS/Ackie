@@ -59,6 +59,9 @@
 	; cmd_fr_get) and setting its state to any value will
 	; cause a clock pulse to be sent to the CPU (this pauses
 	; execution if it was running).
+	;
+	; If fetch is not asserted for 255 clocks, the
+	; processor is stopped.
 	
 	include header.s
 	include usart.h
@@ -236,7 +239,7 @@ SCAN_DIRTY	EQU 2
 	
 	; Number of ticks the system timer must reach before
 	; changing a signal in the FPGA
-HOLD_TIME	EQU 0x100
+HOLD_TIME	EQU 0x80
 	
 	;------------------------------------------------------
 	; Komodo Protocol Constants
@@ -325,7 +328,8 @@ FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
 	
 	; The LEDs & Buttons
 LED_BUS_SHIFT	EQU 23
-BUTTON_BUS_SHIFT	EQU 4
+BUTTONS_BUS_SHIFT	EQU 4
+FIQ_BUTTON_BUS_SHIFT	EQU 11
 	
 	
 	;------------------------------------------------------
@@ -517,6 +521,12 @@ main	; Set the default MMU translation table from ROM
 	; Enable timer and trigger it
 	MOVX R1, #(1<<0) | (1<<2)
 	STR  R1, [R0, #TC_CCR]
+	
+	MOVX R0, #PMC_MCKR
+	LDR  R1, [R0]
+	MOV  R0, #0
+	STR  R1, [R0]
+	STR  R1, [R0,#4]
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Set up variables/globals
@@ -818,15 +828,17 @@ led_read	; Read the state and shift/mask
 	; Returns:
 	;   R0: Button states
 	;------------------------------------------------------
-button_read	; Read the state, invert to active high and shift/mask
-	; XXX: Broken?
-	MOVX R0, #PIOC
-	LDR  R0, [R0, #PIO_PDSR]
-	MVN  R0, R0, LSR #BUTTON_BUS_SHIFT
-	AND  R0, R0, #0x03
+button_read	STMFD SP!, {LR}
 	
-	; Return
-	MOV PC, LR
+	; Read the state, invert to active high and shift/mask
+	MOVX  LR, #PIOC
+	LDR   LR, [LR, #PIO_PDSR]
+	MVN   R0, LR, LSR #BUTTONS_BUS_SHIFT ; Main buttons
+	AND   R0, R0, #0x03
+	TST   LR, #1<<FIQ_BUTTON_BUS_SHIFT   ; FIQ (top) button
+	ORREQ R0, R0, #0x4
+	
+	LDMFD SP!, {PC}
 	
 	
 	;------------------------------------------------------
@@ -1952,6 +1964,8 @@ idle_clock_init	; Has the timer expired?
 	
 	; Increment the clock count
 	MOV R1, R7, LSR #IDLE_COUNT_SHIFT
+	CMP R1, #0xFF
+	BEQ idle_clock_init_t_out
 	ADD R1, R1, #1
 	BIC R7, R7, #IDLE_COUNT_MASK
 	ORR R7, R7, R1, LSL #IDLE_COUNT_SHIFT
@@ -1966,6 +1980,16 @@ idle_clock_init	; Has the timer expired?
 	
 	B idle_process_return
 	
+idle_clock_init_t_out	; The device has been clocked 255 times without a
+	; fetch, stop the CPU (time out!).
+	
+	MOVEQ R8, #STATE_STOPPED_PROG_REQ
+	
+1	; Return to the normal state
+	BIC R7, R7, #IDLE_STATE_MASK
+	ORR R7, R7, #IDLE_NORMAL
+	
+	B idle_process_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; The clock is being cycled. Clear it after one timeout
