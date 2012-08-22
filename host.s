@@ -557,7 +557,6 @@ main	; Set the default MMU translation table from ROM
 	; Load the default (empty) register table/scan-path
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-	BL  get_default_reg_table
 	ADR R0, REG_DEFAULTS_EMPTY
 	BL  load_reg_table
 	
@@ -1762,7 +1761,7 @@ fpga_send_return	; CCLK low
 	; have occurred between signals being produced (for
 	; example a clock signal).
 	;-----------------------------------------------------
-idle_process	STMFD SP!, {R1-R2, LR}
+idle_process	STMFD SP!, {R0-R2, LR}
 	
 	MOVX  LR, #CPU_INFO
 	
@@ -2157,7 +2156,7 @@ idle_scanning_next	; Not finished counting, set the clock high to move
 	
 	
 
-idle_process_return	LDMFD SP!, {R1-R2, PC}
+idle_process_return	LDMFD SP!, {R0-R2, PC}
 	
 	
 	
