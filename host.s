@@ -8,6 +8,12 @@
 	; 16-bit memory-word processor implemented on the
 	; FPGA.
 	;
+	; WARNING: byte-wise memory accesses are not supported
+	; and result in undefined behaviour. This has been
+	; observed in practice to be the cause of a very
+	; bizzare bug where infinate an number of zeros being
+	; returned by a read operation.
+	;
 	; The program begins execution from 'main'. It
 	; executes a main-loop which deals with communications
 	; with the host debugger via the KMD comms protocol.
