@@ -1012,7 +1012,7 @@ load_reg_table	STMFD SP!, {R0-R1, LR}
 	;------------------------------------------------------
 	; Read and execute a command from the host computer
 	;------------------------------------------------------
-handle_command	STMFD SP!, {R0-R3, LR}
+handle_command	STMFD SP!, {R0-R4, LR}
 	
 	; Read the command into R0
 	BL serial_read
@@ -1506,7 +1506,6 @@ cmd_mem_read	; Read from memory
 	CMP R2, R1
 	BNE %b0
 	
-	
 	B handle_command_return
 	
 cmd_mem_write	; Write to memory
@@ -1561,7 +1560,7 @@ cmd_reg	; Store a copy of R1 before masking
 	
 cmd_reg_read	; Read from register
 	
-	; Get the register's valuek
+	; Get the register's value
 0	BL  register_read
 	
 	; Act depending on byte access
@@ -1639,13 +1638,13 @@ handle_command_exec	; Read the number of steps
 cmd_nop	; Not implemented, just fall through to return
 	
 	; Return
-handle_command_return	LDMFD SP!, {R0-R3, PC}
+handle_command_return	LDMFD SP!, {R0-R4, PC}
 
 
 	;-----------------------------------------------------
 	; Get the FPGA ready for a download.
 	;-----------------------------------------------------
-fpga_init	STMFD SP!, {R1-R2, LR}
+fpga_init	STMFD SP!, {R1-R2, R6, LR}
 	
 	; Get PIO port base address
 	MOVX LR, #PIOC
@@ -1685,7 +1684,7 @@ fpga_init	STMFD SP!, {R1-R2, LR}
 	; assumed to be ensured by the speed of the serial
 	; port.
 	
-	LDMFD SP!, {R1-R2, PC}
+	LDMFD SP!, {R1-R2, R6, PC}
 	
 	;-----------------------------------------------------
 	; Load some data (from a bit file) into the FPGA
