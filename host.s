@@ -222,7 +222,9 @@ FPGA_DATA_BUFFER_SIZE	EQU 256
 CPU_INFO	EQU FPGA_DATA_BUFFER + FPGA_DATA_BUFFER_SIZE
 	
 	; The current register being scanned
-REG_CUR_NUM	EQU CPU_INFO + CPU_INFO_LENGTH
+	; (0x100 = large enough to fit the cpu-info but not
+	; unaligned like CPU_INFO_LENGTH)
+REG_CUR_NUM	EQU CPU_INFO + 0x100
 	
 	; The bit in the register currently being scanned
 REG_CUR_BIT	EQU REG_CUR_NUM + 4
@@ -2156,6 +2158,7 @@ idle_scanning_next	; Not finished counting, set the clock high to move
 	; onto the next bit
 	ORR  LR, LR, #SCAN_CLK
 	STRH LR, [R12, #FPGA_REG_SCAN_CONTROL]
+	
 	BL reset_timer
 	B  idle_process_return
 	
@@ -2290,7 +2293,7 @@ scan_bit	STMFD SP!, {R0-R3, LR}
 	
 	; Is the register dirty (i.e. to be written back?)
 	LDRB R3, [LR, #3]
-	TST R3, #SCAN_DIRTY<<16
+	TST R3, #SCAN_DIRTY
 	BNE scan_bit_dirty
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -2335,7 +2338,7 @@ scan_bit_return	; Increment the bit counter
 	
 	; Set the flags depending on whether the next register
 	; has any bits (if its 0 then we just scanned the last
-	; bit
+	; bit)
 	LDRB R2, [LR, #4+2]
 	CMP  R2, #0
 	B %f1
