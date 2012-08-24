@@ -9,10 +9,7 @@
 	; FPGA.
 	;
 	; WARNING: byte-wise memory accesses are not supported
-	; and result in undefined behaviour. This has been
-	; observed in practice to be the cause of a very
-	; bizzare bug where infinate an number of zeros being
-	; returned by a read operation.
+	; and result in undefined behaviour.
 	;
 	; The program begins execution from 'main'. It
 	; executes a main-loop which deals with communications
@@ -22,6 +19,9 @@
 	; is called which is a state-machine which handles
 	; clocking the attached FPGA and scanning out
 	; registers.
+	;
+	; The program consists only of a ROM image starting at
+	; the address specified by ROM_START.
 	;
 	; A number of registers are reserved for global use.
 	;
@@ -68,7 +68,6 @@
 	;
 	; If fetch is not asserted for 255 clocks, the
 	; processor is stopped.
-	;
 	;
 	; The following memory areas are mapped:
 	;   0x0800: Bottom 8-bits are mapped to the LEDs
