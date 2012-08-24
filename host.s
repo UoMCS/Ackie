@@ -284,7 +284,8 @@ SCAN_DIRTY	EQU 2
 	;------------------------------------------------------
 	
 	; Number of ticks the system timer must reach before
-	; changing a signal in the FPGA
+	; changing a signal in the FPGA (so is also the setup
+	; time)
 HOLD_TIME	EQU 0x80
 	
 	;------------------------------------------------------
@@ -2185,7 +2186,7 @@ idle_normal	; Are the register values are being requested?
 	; Send a clock pulse to the scanpath while it is
 	; disabled to cause the scan-registers to sample the
 	; register values.
-idle_normal_do_scan	MOV  LR, #SCAN_CLK
+	MOV  LR, #SCAN_CLK
 	STRH LR, [R12, #FPGA_REG_SCAN_CONTROL]
 	BL   reset_timer
 	
@@ -2204,7 +2205,8 @@ idle_normal_do_scan	MOV  LR, #SCAN_CLK
 	CMP  R8, #STATE_RUNNING
 	BNE  %f0
 	
-1	; Update the memory interface
+1	; Update the memory interface just before sending the
+	; clock pulse
 	BL emulate_memory
 	
 	BL reset_timer
@@ -2307,7 +2309,8 @@ idle_clock	; Has the timer expired?
 	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	
 	; Do any memory accesses the CPU is requesting (at the
-	; negative edge of the clock)
+	; negative edge of the clock) to ensure it definately
+	; happens.
 	BL emulate_memory
 	
 	; Wait again
