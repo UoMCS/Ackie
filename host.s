@@ -224,6 +224,9 @@ IDLE_FLAG_SCANNED_LAST	EQU 0x040000
 	; Flag indicates that the last bit is now clocked in
 IDLE_FLAG_SCAN_COMPLETE	EQU 0x080000
 	
+	; Flag indicates that the LCD may have been changed
+IDLE_FLAG_LCD_CHANGED	EQU 0x100000
+	
 	;------------------------------------------------------
 	; RAM Allocation (Addresses of variables/arrays in the
 	; main system RAM)
@@ -666,6 +669,9 @@ main	; Set the default MMU translation table from ROM
 	SUBS R1, R1, #1
 	BNE  %b0
 	
+	; Cause the LCD to be updated
+	ORR R7, R7, #IDLE_FLAG_LCD_CHANGED
+	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Mainloop
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -891,6 +897,15 @@ memory_read	STMFD SP!, {R1,LR}
 	MOVX LR, #MEMORY_MASK
 	AND  LR, LR, R2
 	
+	; Skip checking for memory-mapped stuff if not in range
+	; of it
+	MOVX R1, #0x07FF
+	BIC  R1, LR, R1
+	CMP  R1, #0x0800
+	BNE  %f4
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
 	; Is this an LED read?
 	MOV R0, #0x800
 	CMP LR, R0
@@ -1036,6 +1051,15 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	MOVX LR, #MEMORY_MASK
 	AND  LR, LR, R2
 	
+	; Skip checking for memory-mapped stuff if not in range
+	; of it
+	MOVX R1, #0x07FF
+	BIC  R1, LR, R1
+	CMP  R1, #0x0800
+	BNE  %f3
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
 	; Is this an LED write?
 	MOV R2, #0x800
 	CMP LR, R2
@@ -1066,6 +1090,7 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	MOVX R2, #LCD_REQUEST_BUFFER
 	AND  R1, LR, #0x1F
 	STRB R0, [R2, R1]
+	ORR R7, R7, #IDLE_FLAG_LCD_CHANGED
 	B    memory_write_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1083,6 +1108,7 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	AND  R1, LR, #0x0F
 	MOV  R1, R1, LSL #1
 	STRH R0, [R2, R1]
+	ORR R7, R7, #IDLE_FLAG_LCD_CHANGED
 	B    memory_write_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -2062,8 +2088,11 @@ idle_process	STMFD SP!, {R0-R2, LR}
 	; Also set the state to the start state and assert the
 	; registers available flag so that nothing will be
 	; stuck waiting for the registers to become available.
-	MOV R7, #IDLE_START
-	ORR R7, R7, #IDLE_FLAG_REGS_AVAIL
+	; Preserve the LCD changed flag
+	TST   R7, #IDLE_FLAG_LCD_CHANGED
+	MOV   R7, #IDLE_START
+	ORRNE R7, R7, #IDLE_FLAG_LCD_CHANGED
+	ORR   R7, R7, #IDLE_FLAG_REGS_AVAIL
 	B   idle_process_return
 	
 	; Jump depemding on the state of the idle process
@@ -2420,8 +2449,9 @@ idle_scanning_next	; Not finished counting, set the clock high to move
 	
 	
 
-idle_process_return	; One last thing... Update the LCD
-	BL lcd_update
+idle_process_return	; One last thing... Update the LCD (if needed)
+	TST  R7, #IDLE_FLAG_LCD_CHANGED
+	BLNE lcd_update
 	
 	LDMFD SP!, {R0-R2, PC}
 	
@@ -2476,6 +2506,7 @@ lcd_state_idle	; Get the addresses of the request and response buffers
 	BLT  %b0
 	
 	; No characters differed, return, doing nothing
+	BIC R7, R7, #IDLE_FLAG_LCD_CHANGED
 	B lcd_update_return
 	
 lcd_state_idle_cdif	; Enter the waiting state to wait until the LCD is
