@@ -121,6 +121,12 @@ CONTROLLER_SUBTYPE	EQU 0x0000
 FPGA_FEATURE	EQU 0
 CONTROLLER_FEATURE	EQU 1
 	
+	; LCD Size
+LCD_ROWS	EQU 2
+LCD_COLS	EQU 16
+LCD_VCOLS	EQU 0x40 ; Virtual columns
+LCD_BUFFER_SIZE	EQU LCD_ROWS*LCD_COLS
+	
 	;------------------------------------------------------
 	; Idle-process global state register constants
 	;
@@ -218,8 +224,21 @@ MEMORY_MASK	EQU 0xFFFF
 FPGA_DATA_BUFFER	EQU MEMORY_START + (MEMORY_MASK<<1) + 2
 FPGA_DATA_BUFFER_SIZE	EQU 256
 	
+	; A word containing the state of the LCD update routine
+	;   7:0 - State
+	;  15:8 - Current character number
+	; 31:16 - Zeros
+LCD_STATE	EQU FPGA_DATA_BUFFER + FPGA_DATA_BUFFER_SIZE
+	
+	; The string which the LCD should ideally display
+LCD_REQUEST_BUFFER	EQU LCD_STATE + 4
+	
+	; The string currently displayed on the LCD (for
+	; comparison with the LCD_REQUEST_BUFFER)
+LCD_CONTENTS_BUFFER	EQU LCD_REQUEST_BUFFER + LCD_BUFFER_SIZE
+
 	; The current cpu info (for wot_r_u)
-CPU_INFO	EQU FPGA_DATA_BUFFER + FPGA_DATA_BUFFER_SIZE
+CPU_INFO	EQU LCD_CONTENTS_BUFFER + LCD_BUFFER_SIZE
 	
 	; The current register being scanned
 	; (0x100 = large enough to fit the cpu-info but not
@@ -335,10 +354,44 @@ FPGA_BUS	EQU 0xFF << FPGA_BUS_SHIFT
 	;------------------------------------------------------
 	
 	; The LEDs & Buttons
+LED_NENABLE	EQU 1<<6 ; Active low
 LED_BUS_SHIFT	EQU 23
 BUTTONS_BUS_SHIFT	EQU 4
 FIQ_BUTTON_BUS_SHIFT	EQU 11
 	
+	;------------------------------------------------------
+	; LCD Control Constants (see LCD_STATE)
+	;------------------------------------------------------
+	
+	; LCD writing routine states
+LCD_STATE_MASK	EQU 0xFF
+LCD_STATE_IDLE	EQU 0x00
+LCD_STATE_WAITING	EQU 0x01
+LCD_STATE_ADDR	EQU 0x02
+LCD_STATE_ADDR_WAITING	EQU 0x03
+LCD_STATE_DATA	EQU 0x04
+	
+	; Index of the character in the buffer currently being
+	; written
+LCD_CHAR_NUM_SHIFT	EQU 8
+LCD_CHAR_NUM_MASK	EQU 0xFF << LCD_CHAR_NUM_SHIFT
+	
+	; LCD Signal Pins
+LCD_E_BIT	EQU 3                    ; Enable bit number
+LCD_E	EQU 1<<LCD_E_BIT         ; Enable
+LCD_BACKLIGHT_BIT	EQU 7                    ; Backlight bit number
+LCD_BACKLIGHT	EQU 1<<LCD_BACKLIGHT_BIT ; Backlight
+LCD_RS_BIT	EQU 16                   ; Register select bit number
+LCD_RS	EQU 1<<LCD_RS_BIT        ; Register select
+LCD_RW_BIT	EQU 17                   ; Read/nWrite bit number
+LCD_RW	EQU 1<<LCD_RW_BIT        ; Read/nWrite
+LCD_DATA_SHIFT	EQU 23
+LCD_DATA_MASK	EQU 0xFF << LCD_DATA_SHIFT
+	
+	; LCD Busy flag in the status register
+LCD_BF	EQU 1<<7
+	; LCD Set Address Command
+LCD_SET_ADDR	EQU 1<<7
 	
 	;------------------------------------------------------
 	; Start of ROM Image
@@ -480,7 +533,7 @@ main	; Set the default MMU translation table from ROM
 	MCR  P15, 0, R0, C1, C0, 0
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-	; Setup PIO for FPGA
+	; Setup PIO for FPGA/LCD
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Get PIO port base address
 	MOVX R0, #PIOC
@@ -567,6 +620,35 @@ main	; Set the default MMU translation table from ROM
 	
 	ADR R0, REG_DEFAULTS_EMPTY
 	BL  load_reg_table
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Set up the LCD
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; Reset LCD controller state
+	MOV  R0, #LCD_STATE_IDLE
+	MOVX R1, #LCD_STATE
+	STR  R0, [R1]
+	
+	; Set up the display so that spaces will be written
+	; over it initially
+	
+	; Write spaces to the request buffer
+	MOVX R0, #LCD_REQUEST_BUFFER
+	MOV  R1, #LCD_BUFFER_SIZE
+	MOV  R2, #' '
+0	STRB R2, [R0], #1
+	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Write something else to the contents buffer so the
+	; routine replaces them.
+	MOVX R0, #LCD_CONTENTS_BUFFER
+	MOV  R1, #LCD_BUFFER_SIZE
+	MOV  R2, #'J'
+0	STRB R2, [R0], #1
+	SUBS R1, R1, #1
+	BNE  %b0
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Mainloop
@@ -780,7 +862,7 @@ serial_read_loop	BL   serial_read
 	; Returns:
 	;   R0: Value
 	;------------------------------------------------------
-memory_read	STMFD SP!, {LR}
+memory_read	STMFD SP!, {R1,LR}
 	
 	; Mask off the address
 	MOVX LR, #MEMORY_MASK
@@ -803,14 +885,30 @@ memory_read	STMFD SP!, {LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-1	; This is a plain-n-simple memory access
+1	; Is this an LCD buffer read? (the 32 words following
+	; 0x820)
+	MOVX R0, #0x820
+	BIC  R1, LR, #0x1F
+	CMP  R1, R0
+	BNE  %f2
+	; Read from the LCD contents buffer (this means the
+	; value read back from the LCD won't match what you
+	; wrote until the write completes).
+	MOVX R0, #LCD_CONTENTS_BUFFER
+	AND  R1, LR, #0x1F
+	LDRB R0, [R0, R1]
+	B    memory_read_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+2	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	
 	; Load the value
 	LDRH  R0, [LR, #MEMORY_START]
 	
-memory_read_return	LDMFD SP!, {PC}
+memory_read_return	LDMFD SP!, {R1,PC}
 	
 	
 	;------------------------------------------------------
@@ -859,7 +957,7 @@ button_read	STMFD SP!, {LR}
 	;   R0: Value
 	;   R2: Address
 	;------------------------------------------------------
-memory_write	STMFD SP!, {LR}
+memory_write	STMFD SP!, {R1,R2,LR}
 	
 	; Mask off the address
 	MOVX LR, #MEMORY_MASK
@@ -873,14 +971,30 @@ memory_write	STMFD SP!, {LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-0	; This is a plain-n-simple memory access
+0	; Is this an LCD buffer read? (the 32 words following
+	; 0x820)
+	MOVX R2, #0x820
+	BIC  R1, LR, #0x1F
+	CMP  R1, R2
+	BNE  %f1
+	; Read from the LCD contents buffer (this means the
+	; value read back from the LCD won't match what you
+	; wrote until the write completes).
+	MOVX R2, #LCD_REQUEST_BUFFER
+	AND  R1, LR, #0x1F
+	STRB R0, [R2, R1]
+	B    memory_write_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+1	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	
 	; Store the value
 	STRH  R0, [LR, #MEMORY_START]
 	
-memory_write_return	LDMFD SP!, {PC}
+memory_write_return	LDMFD SP!, {R1,R2,PC}
 	
 	
 	;------------------------------------------------------
@@ -1486,7 +1600,12 @@ handle_command_mem	; Store the command in R1
 	; Byte-wise accesses are not supported and will result
 	; in undefined behaviour.
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
-cmd_mem	; Read or write? (flag is stored until branch)
+cmd_mem	; Check the access is not a byte-access. If it is, just
+	; ignore the bytes or send back dummy data.
+	TST R1, #ELEMENT_SIZE_MASK
+	BEQ cmd_mem_byte
+	
+	; Read or write? (flag is stored until branch)
 	TST R1, #READ_BIT
 	
 	; Mask off the element size and scale so that it is in
@@ -1528,6 +1647,22 @@ cmd_mem_write	; Write to memory
 	BNE %b0
 	
 	B handle_command_return
+	
+cmd_mem_byte	; Deal with an non-handleable byte access
+	TST R1, #READ_BIT
+	BNE cmd_mem_absorb
+	
+cmd_mem_dummy	; Send dummy data in response to a write
+	BL   memory_write
+	SUBS R3, R3, #1
+	BNE  cmd_mem_dummy
+	B    handle_command_return
+	
+cmd_mem_absorb	; Absorb the invalid data being sent
+	BL   memory_read
+	SUBS R3, R3, #1
+	BNE  cmd_mem_absorb
+	B    handle_command_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Register read/write command
@@ -2164,7 +2299,159 @@ idle_scanning_next	; Not finished counting, set the clock high to move
 	
 	
 
-idle_process_return	LDMFD SP!, {R0-R2, PC}
+idle_process_return	; One last thing... Update the LCD
+	BL lcd_update
+	
+	LDMFD SP!, {R0-R2, PC}
+	
+	
+	
+	;-----------------------------------------------------
+	; LCD-driving state-machine. This should be run
+	; periodically (for example at the end of the
+	; idle_process). Keeps the LCD in sync with the data in
+	; LCD_REQUEST_BUFFER.
+	;
+	; On entering each state, R1 contains the LCD_STATE
+	; address and R3 the current state.
+	;-----------------------------------------------------
+lcd_update	STMFD SP!, {R0-R4, LR}
+	
+	; Get the current state
+	MOVX  R1, #LCD_STATE
+	LDR   R3, [R1]
+	
+	; Jump depemding on the state of the routine
+	AND R4, R3, #IDLE_STATE_MASK
+	ADD PC, PC, R4, LSL #2
+	NOP
+	; Start of jump-table
+	B lcd_state_idle
+	B lcd_state_waiting
+	B lcd_state_addr
+	B lcd_state_addr_waiting
+	B lcd_state_data
+	; End of table
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; LCD Idle
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+lcd_state_idle	; Get the addresses of the request and response buffers
+	ADD R0, R1, #LCD_REQUEST_BUFFER - LCD_STATE
+	ADD R1, R0, #LCD_BUFFER_SIZE
+	
+	; Counter into the buffer
+	MOV R2, #0
+	
+	; Check to see if any chars differ
+0	LDRB R3, [R0, R2]
+	LDRB R4, [R1, R2]
+	CMP  R3, R4
+	BNE  lcd_state_idle_cdif
+	
+	; Increment the counter
+	ADD  R2, R2, #1
+	CMP  R2, #LCD_BUFFER_SIZE
+	BLT  %b0
+	
+	; No characters differed, return, doing nothing
+	B lcd_update_return
+	
+lcd_state_idle_cdif	; Enter the waiting state to wait until the LCD is
+	; ready before writing the char we just found.
+	MOVX  LR, #LCD_STATE
+	LDR   R0, [LR]
+	; Set the char number
+	BIC   R0, R0, #LCD_CHAR_NUM_MASK
+	ORR   R0, R0, R2, LSL #LCD_CHAR_NUM_SHIFT
+	; Set the state
+	BIC   R0, R0, #LCD_STATE_MASK
+	ORR   R0, R0, #LCD_STATE_WAITING
+	STR   R0, [LR]
+	
+	B lcd_update_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; LCD Waiting until not busy
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+lcd_state_waiting	; Check to see if the LCD is busy
+	MOV R2, #0
+	BL  lcd_read
+	TST R0, #LCD_BF
+	BNE lcd_update_return
+	
+	; Not busy: move to the address-sending state
+	BIC R3, R3, #LCD_STATE_MASK
+	ORR R3, R3, #LCD_STATE_ADDR
+	STR R3, [R1]
+	
+	B lcd_update_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; LCD Ready, send the Address
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+lcd_state_addr	; Get the current char address
+	MOV R0, R3, LSR #LCD_CHAR_NUM_SHIFT
+	
+	; Wrap the address accross lines
+	CMP   R0, #LCD_COLS
+	ADDGE R0, R0, #LCD_VCOLS-LCD_COLS
+	
+	; Set the 'set address' bit
+	ORR R0, R0, #LCD_SET_ADDR
+	
+	; Write the address to the instruction reg
+	MOV R2, #0
+	BL  lcd_write
+	
+	; Send the data
+	BIC R3, R3, #LCD_STATE_MASK
+	ORR R3, R3, #LCD_STATE_ADDR_WAITING
+	STR R3, [R1]
+	
+	B lcd_update_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; LCD Waiting until not busy after setting address
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+lcd_state_addr_waiting	; Check to see if the LCD is busy
+	MOV R2, #0
+	BL  lcd_read
+	TST R0, #LCD_BF
+	BNE lcd_update_return
+	
+	; Not busy: move to the address-sending state
+	BIC R3, R3, #LCD_STATE_MASK
+	ORR R3, R3, #LCD_STATE_DATA
+	STR R3, [R1]
+	
+	B lcd_update_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; LCD Ready, address is set, send the data
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+lcd_state_data	; Get the current char address
+	MOV R3, R3, LSR #LCD_CHAR_NUM_SHIFT
+	
+	; Read the char from the request buffer
+	MOVX R2, #LCD_REQUEST_BUFFER
+	LDRB R0, [R2, R3]
+	; Note that the char is now set propperly
+	ADD R2, R2, #LCD_BUFFER_SIZE ; The LCD_CONTENTS_BUFFER
+	STRB R0, [R2, R3]
+	
+	; Write the char to the data reg
+	MOV R2, #1
+	BL  lcd_write
+	
+	; Done, go back  to idle
+	MOV R3, #LCD_STATE_IDLE
+	STR R3, [R1]
+	
+	B lcd_update_return
+	
+	
+lcd_update_return	LDMFD SP!, {R0-R4, PC}
 	
 	
 	
@@ -2351,5 +2638,158 @@ scan_bit_return	; Increment the bit counter
 1	MOVX LR, #REG_CUR_NUM
 	STR  R0, [LR]
 	STR  R1, [LR, #4]
+	
+	LDMFD SP!, {R0-R3, PC}
+	
+	
+	;-----------------------------------------------------
+	; Read from the LCD
+	; Argument:
+	;   R2: The register (0 = instruction, 1 = data)
+	; Returns:
+	;   R0: Value Read
+	; Internally:
+	;   R3: The LED states
+	;   LR: PIOC
+	;-----------------------------------------------------
+lcd_read	STMFD SP!, {R1-R3, LR}
+	
+	MOVX LR, #PIOC
+	
+	; Store the LED state
+	LDR R3, [LR, #PIO_PDSR]
+	
+	; Turn off the LEDs
+	MOV R1, #LED_NENABLE
+	STR R1, [LR, #PIO_SODR]
+	
+	; Set the bus to read mode (output disabled)
+	MOVX R1, #LCD_DATA_MASK
+	STR  R1, [LR, #PIO_ODR]
+	
+	; Set the register select
+	MOV   R1, #LCD_RS
+	TST   R2, #1
+	STRNE R1, [LR, #PIO_SODR]
+	STREQ R1, [LR, #PIO_CODR]
+	
+	; Put the LCD into read-mode (driving the bus)
+	MOV R1, #LCD_RW
+	STR R1, [LR, #PIO_SODR]
+	
+	; Set-up time
+	MOV  R1, #0x20
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Enable the LCD
+	MOV R1, #LCD_E
+	STR R1, [LR, #PIO_SODR]
+	
+	; Hold time
+	MOV  R1, #0xF0
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; Read the value
+	LDR R0, [LR, #PIO_PDSR]
+	MOV R0, R0, LSR #LCD_DATA_SHIFT
+	AND R0, R0, #0xFF
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; Disable the LCD
+	MOV R1, #LCD_E
+	STR R1, [LR, #PIO_CODR]
+	
+	; Clock shut down time
+	MOV  R1, #0xF0
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Put the LCD into write-mode (high impedance)
+	MOV R1, #LCD_RW
+	STR R1, [LR, #PIO_CODR]
+	
+	; Set the bus to write mode (output enabled)
+	MOVX R1, #LCD_DATA_MASK
+	STR  R1, [LR, #PIO_OER]
+	
+	; Restore the LED state
+	STR R3, [LR, #PIO_ODSR]
+	
+	; Turn on the LEDs
+	MOV R1, #LED_NENABLE
+	STR R1, [LR, #PIO_CODR]
+	
+	LDMFD SP!, {R1-R3, PC}
+	
+	
+	;-----------------------------------------------------
+	; Write to the LCD
+	; Argument:
+	;   R0: The value to write
+	;   R2: The register (0 = instruction, 1 = data)
+	; Internally:
+	;   R3: The LED states
+	;   LR: PIOC
+	;-----------------------------------------------------
+lcd_write	STMFD SP!, {R0-R3, LR}
+	
+	MOVX LR, #PIOC
+	
+	; Store the LED state
+	LDR R3, [LR, #PIO_PDSR]
+	
+	; Turn off the LEDs
+	MOV R1, #LED_NENABLE
+	STR R1, [LR, #PIO_SODR]
+	
+	; Set the register select
+	MOV   R1, #LCD_RS
+	TST   R2, #1
+	STRNE R1, [LR, #PIO_SODR]
+	STREQ R1, [LR, #PIO_CODR]
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; Write the value
+	AND R0, R0, #0xFF
+	MOV R0, R0, LSL #LCD_DATA_SHIFT
+	STR R0, [LR, #PIO_ODSR]
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+	; Set-up time
+	MOV  R1, #0x20
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Enable the LCD
+	MOV R1, #LCD_E
+	STR R1, [LR, #PIO_SODR]
+	
+	; Hold time
+	MOV  R1, #0xF0
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Disable the LCD
+	MOV R1, #LCD_E
+	STR R1, [LR, #PIO_CODR]
+	
+	; Clock shut down time
+	MOV  R1, #0xF0
+0	SUBS R1, R1, #1
+	BNE  %b0
+	
+	; Restore the LED state
+	STR R3, [LR, #PIO_ODSR]
+	
+	; Turn on the LEDs
+	MOV R1, #LED_NENABLE
+	STR R1, [LR, #PIO_CODR]
 	
 	LDMFD SP!, {R0-R3, PC}
