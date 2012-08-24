@@ -68,6 +68,14 @@
 	;
 	; If fetch is not asserted for 255 clocks, the
 	; processor is stopped.
+	;
+	;
+	; The following memory areas are mapped:
+	;   0x0800: Bottom 8-bits are mapped to the LEDs
+	;   0x0801: Bottom 3-bits are mapped to the buttons
+	;   0x0802: Bottom bit is the LCD backlight state
+	;   0x0820: This and the next 31 words are the current
+	;           contents of the LCD's 32 characters.
 	
 	include header.s
 	include usart.h
@@ -856,6 +864,9 @@ serial_read_loop	BL   serial_read
 	; The following areas are mapped:
 	;   0x0800: Bottom 8-bits are mapped to the LEDs
 	;   0x0801: Bottom 3-bits are mapped to the buttons
+	;   0x0802: Bottom bit is the LCD backlight state
+	;   0x0820: This and the next 31 words are the current
+	;           contents of the LCD's 32 characters.
 	;
 	; Argument:
 	;   R2: Address
@@ -869,7 +880,8 @@ memory_read	STMFD SP!, {R1,LR}
 	AND  LR, LR, R2
 	
 	; Is this an LED read?
-	CMP LR, #0x800
+	MOV R0, #0x800
+	CMP LR, R0
 	BNE %f0
 	BL  led_read
 	B   memory_read_return
@@ -877,7 +889,7 @@ memory_read	STMFD SP!, {R1,LR}
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
 0	; Is this a button read?
-	MOVX R0, #0x801
+	ADD  R0, R0, #1 ; R0 = 0x801
 	CMP  LR, R0
 	BNE  %f1
 	BL   button_read
@@ -885,12 +897,21 @@ memory_read	STMFD SP!, {R1,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-1	; Is this an LCD buffer read? (the 32 words following
+1	; Is this a LCD backlight read?
+	ADD  R0, R0, #1 ; R0 = 0x802
+	CMP  LR, R0
+	BNE  %f2
+	BL   lcd_backlight_read
+	B    memory_read_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+2	; Is this an LCD buffer read? (the 32 words following
 	; 0x820)
 	MOVX R0, #0x820
 	BIC  R1, LR, #0x1F
 	CMP  R1, R0
-	BNE  %f2
+	BNE  %f3
 	; Read from the LCD contents buffer (this means the
 	; value read back from the LCD won't match what you
 	; wrote until the write completes).
@@ -901,7 +922,7 @@ memory_read	STMFD SP!, {R1,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-2	; This is a plain-n-simple memory access
+3	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	
@@ -922,6 +943,22 @@ led_read	; Read the state and shift/mask
 	LDR  R0, [R0, #PIO_PDSR]
 	MOV  R0, R0, LSR #LED_BUS_SHIFT
 	AND  R0, R0, #0xFF
+	
+	; Return
+	MOV PC, LR
+	
+	
+	;------------------------------------------------------
+	; Read the state of the LCD backlight
+	;
+	; Returns:
+	;   R0: Bit 0 is the backlight state
+	;------------------------------------------------------
+lcd_backlight_read	; Read the state and shift/mask
+	MOVX R0, #PIOC
+	LDR  R0, [R0, #PIO_PDSR]
+	MOV  R0, R0, LSR #LCD_BACKLIGHT_BIT
+	AND  R0, R0, #1
 	
 	; Return
 	MOV PC, LR
@@ -952,6 +989,9 @@ button_read	STMFD SP!, {LR}
 	; The following areas are mapped:
 	;   0x0800: Bottom 8-bits are mapped to the LEDs
 	;   0x0801: Bottom 3-bits are mapped to the buttons
+	;   0x0802: Bottom bit is the LCD backlight state
+	;   0x0820: This and the next 31 words are the current
+	;           contents of the LCD's 32 characters.
 	;
 	; Argument:
 	;   R0: Value
@@ -964,19 +1004,29 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	AND  LR, LR, R2
 	
 	; Is this an LED write?
-	CMP LR, #0x800
+	MOV R2, #0x800
+	CMP LR, R2
 	BNE %f0
 	BL  led_write
 	B   memory_write_return
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-0	; Is this an LCD buffer read? (the 32 words following
+0	; Is this an LCD backlight write?
+	ADD R2, R2, #2 ; R2 = 0x802
+	CMP LR, R2
+	BNE %f1
+	BL  lcd_backlight_write
+	B   memory_write_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+1	; Is this an LCD buffer read? (the 32 words following
 	; 0x820)
 	MOVX R2, #0x820
 	BIC  R1, LR, #0x1F
 	CMP  R1, R2
-	BNE  %f1
+	BNE  %f2
 	; Read from the LCD contents buffer (this means the
 	; value read back from the LCD won't match what you
 	; wrote until the write completes).
@@ -987,7 +1037,7 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-1	; This is a plain-n-simple memory access
+2	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	
@@ -1013,6 +1063,27 @@ led_write	STMFD SP!, {R0, LR}
 	MOVX LR, #PIOC
 	STR  R0, [LR, #PIO_ODSR]
 	
+	LDMFD SP!, {R0, PC}
+	
+	
+	;------------------------------------------------------
+	; Write the state of the LCD backlight
+	;
+	; Argument:
+	;   R0: Bit 0 is the backlight state
+	;------------------------------------------------------
+lcd_backlight_write	STMFD SP!, {R0, LR}
+	
+	; Decide what to do
+	TST   R0, #1
+	
+	; Set the state
+	MOVX  LR, #PIOC
+	MOV   R0, #LCD_BACKLIGHT
+	STRNE R0, [LR, #PIO_SODR]
+	STREQ R0, [LR, #PIO_CODR]
+	
+	; Return
 	LDMFD SP!, {R0, PC}
 	
 	;------------------------------------------------------
@@ -1093,7 +1164,7 @@ get_default_reg_table	STMFD SP!, {R1-R2, LR}
 	
 	; Search the set of register tables for a suitable
 	; table
-	ADR  LR, REG_DEFAULTS
+	ADRL LR, REG_DEFAULTS
 	MOV  R2, LR
 0	LDRH R0, [R2], #4
 	CMP  R1, R0
