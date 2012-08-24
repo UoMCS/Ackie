@@ -1194,7 +1194,7 @@ register_read	STMFD SP!, {LR}
 	;   R0: Value
 	;   R2: Register 'Address'
 	;------------------------------------------------------
-register_write	STMFD SP!, {R0-R1, LR}
+register_write	STMFD SP!, {R0-R2, LR}
 	
 	; Set the flag ensuring registers are kept up-to-date
 	ORR R7, R7, #IDLE_REQ_REG_WRITE
@@ -1211,6 +1211,13 @@ register_write	STMFD SP!, {R0-R1, LR}
 	CMP R0, #0
 	BEQ %f0
 	
+	; Mask only the bits in the register
+	LDRB R2, [LR, #2]
+	MOV  R1, #1
+	MOV  R1, R1, LSL R2
+	SUB  R1, R1, #1
+	AND  R0, R0, R1
+	
 	; Store the register's new value
 	STRH  R0, [LR]
 	
@@ -1218,7 +1225,7 @@ register_write	STMFD SP!, {R0-R1, LR}
 	MOV  R0, #SCAN_DIRTY
 	STRB R0, [LR, #3]
 	
-0	LDMFD SP!, {R0-R1, PC}
+0	LDMFD SP!, {R0-R2, PC}
 	
 	
 	;-----------------------------------------------------
