@@ -18,7 +18,12 @@
 	; iteration of the main-loop) the idle_process function
 	; is called which is a state-machine which handles
 	; clocking the attached FPGA and scanning out
-	; registers.
+	; registers. At the end of the idle-process another
+	; state machine runs which handles driving the LCD.
+	; This state machine writes characters in
+	; LCD_REQUEST_BUFFER which don't match their
+	; corresponding value in LCD_CONTENTS_BUFFER and hides
+	; the nasties of using such displays.
 	;
 	; The program consists only of a ROM image starting at
 	; the address specified by ROM_START.
@@ -75,6 +80,10 @@
 	;   0x0802: Bottom bit is the LCD backlight state
 	;   0x0820: This and the next 31 words are the current
 	;           contents of the LCD's 32 characters.
+	;   0x0840: This and the next 16 words are the current
+	;           contents of the LCD's 32 characters as
+	;           two consecutive characters packed into each
+	;           byte (for convenient loading of strings)
 	
 	include header.s
 	include usart.h
@@ -866,6 +875,10 @@ serial_read_loop	BL   serial_read
 	;   0x0802: Bottom bit is the LCD backlight state
 	;   0x0820: This and the next 31 words are the current
 	;           contents of the LCD's 32 characters.
+	;   0x0840: This and the next 16 words are the current
+	;           contents of the LCD's 32 characters as
+	;           two consecutive characters packed into each
+	;           byte (for convenient loading of strings)
 	;
 	; Argument:
 	;   R2: Address
@@ -921,7 +934,24 @@ memory_read	STMFD SP!, {R1,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-3	; This is a plain-n-simple memory access
+3	; Is this an LCD byte-buffer read? (the 16 words following
+	; 0x840)
+	MOVX R0, #0x840
+	BIC  R1, LR, #0x0F
+	CMP  R1, R0
+	BNE  %f4
+	; Read from the LCD contents buffer (this means the
+	; value read back from the LCD won't match what you
+	; wrote until the write completes).
+	MOVX R0, #LCD_CONTENTS_BUFFER
+	AND  R1, LR, #0x0F
+	MOV  R1, R1, LSL #1
+	LDRH R0, [R0, R1]
+	B    memory_read_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+4	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	
@@ -991,6 +1021,10 @@ button_read	STMFD SP!, {LR}
 	;   0x0802: Bottom bit is the LCD backlight state
 	;   0x0820: This and the next 31 words are the current
 	;           contents of the LCD's 32 characters.
+	;   0x0840: This and the next 16 words are the current
+	;           contents of the LCD's 32 characters as
+	;           two consecutive characters packed into each
+	;           byte (for convenient loading of strings)
 	;
 	; Argument:
 	;   R0: Value
@@ -1020,7 +1054,7 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-1	; Is this an LCD buffer read? (the 32 words following
+1	; Is this an LCD buffer write? (the 32 words following
 	; 0x820)
 	MOVX R2, #0x820
 	BIC  R1, LR, #0x1F
@@ -1036,7 +1070,24 @@ memory_write	STMFD SP!, {R1,R2,LR}
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
-2	; This is a plain-n-simple memory access
+2	; Is this an LCD buffer byte write? (the 16 words following
+	; 0x840)
+	MOVX R2, #0x840
+	BIC  R1, LR, #0x0F
+	CMP  R1, R2
+	BNE  %f3
+	; Read from the LCD contents buffer (this means the
+	; value read back from the LCD won't match what you
+	; wrote until the write completes).
+	MOVX R2, #LCD_REQUEST_BUFFER
+	AND  R1, LR, #0x0F
+	MOV  R1, R1, LSL #1
+	STRH R0, [R2, R1]
+	B    memory_write_return
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	
+3	; This is a plain-n-simple memory access
 	; And convert into a byte address
 	MOV LR, LR, LSL #1
 	

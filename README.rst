@@ -18,6 +18,10 @@ memory-mapped devices. The following areas are mapped::
 	0x0802: Bottom bit is the LCD backlight state
 	0x0820: This and the next 31 words are the current
 	        contents of the LCD's 32 characters.
+	0x0840: This and the next 16 words are the current
+	        contents of the LCD's 32 characters as
+	        two consecutive characters packed into each
+	        byte (for convenient loading of strings)
 
 
 Download of Host Program
