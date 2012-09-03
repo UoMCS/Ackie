@@ -10,6 +10,11 @@ suitably-instrumented 16-bit memory-word processor implemented on the FPGA. The
 CPU ID/Sub-ID are derrived from the device loaded onto the FPGA and the
 scan-path description loaded into the host. (See host.s for details).
 
+Usage
+-----
+
+See USAGE.rst for a brief tutorial on how you use ackie as an end-user.
+
 Clocking
 --------
 
@@ -35,7 +40,7 @@ memory-mapped devices. The following areas are mapped::
 	0x0840: This and the next 16 words are the current
 	        contents of the LCD's 32 characters as
 	        two consecutive characters packed into each
-	        byte (for convenient loading of strings)
+	        word (for convenient loading of strings)
 
 To a simple approximation, the memory is synchronous on the back-edge of the
 clock.
@@ -97,7 +102,7 @@ Installing the host program
 ```````````````````````````
 Assemble using::
 
-	aasm -e host.s host.s
+	aasm -e host.elf host.s
 
 And then load onto the device using::
 
