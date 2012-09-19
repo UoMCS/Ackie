@@ -1677,11 +1677,13 @@ cmd_stop	; Does nothing if busy
 	CMP R8,  #STATE_BUSY
 	BEQ handle_command_return
 	
-	; Stop the CPU
-	MOV R8, #STATE_STOPPED
+	; If the CPU is not already stopped, just set only one
+	; remaining step so that it will stop after the current
+	; step.
+	CMP   R8, #STATE_STOPPED
 	
-	; Clear remaining steps
-	MOV R10, #0
+	; Set one remaining step if not already stopped
+	MOVNE R10, #1
 	
 	B handle_command_return
 	
