@@ -175,26 +175,31 @@ IDLE_COUNT_SHIFT	EQU 24
 IDLE_START	EQU 0x00
 	
 	; The processor reset line is being held down, wait for
-	; a while and then release it.
+	; a while then clock the processor
 IDLE_RESETTING	EQU 0x01
+	
+	; The processor reset line is being held down and the
+	; clock line is high. Wait a while then take the clock
+	; off and then the reset off.
+IDLE_RESETTING_CLK	EQU 0x02
 	
 	; State when the processor is set up and the idle
 	; process should pay attention to the requested
 	; processor state variables
-IDLE_NORMAL	EQU 0x02
+IDLE_NORMAL	EQU 0x03
 	
 	; Make sure the memory interface shows the correct data
 	; before clocking begins.
-IDLE_CLOCK_INIT	EQU 0x03
+IDLE_CLOCK_INIT	EQU 0x04
 	
 	; The clock is being cycled.
-IDLE_CLOCK	EQU 0x04
+IDLE_CLOCK	EQU 0x05
 	
 	; The scan-path is being initialised
-IDLE_SCAN_INIT	EQU 0x05
+IDLE_SCAN_INIT	EQU 0x06
 	
 	; The scan-path is being cycled
-IDLE_SCANNING	EQU 0x06
+IDLE_SCANNING	EQU 0x07
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	
@@ -2112,6 +2117,7 @@ idle_process	STMFD SP!, {R0-R2, LR}
 	; Start of jump-table
 	B idle_start
 	B idle_resetting
+	B idle_resetting_clk
 	B idle_normal
 	B idle_clock_init
 	B idle_clock
@@ -2152,8 +2158,29 @@ idle_start	; Reset the CPU
 	
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 	; Allow the reset line to be held down for some period
+	; before the clock is pulsed (to allow for synchronous
+	; reset).
 	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
 idle_resetting	; If the timer hasn't expired, wait.
+	BL  hold_time_elapsed
+	BLT idle_process_return
+	
+	; Set the clock signal high (as well as reset)
+	MOV  LR, #(DUT_RESET|DUT_CLK)
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
+	BL   reset_timer
+	
+	; Move to the next state
+	BIC R7, R7, #IDLE_STATE_MASK
+	ORR R7, R7, #IDLE_RESETTING_CLK
+	
+	B idle_process_return
+	
+	
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+	; Allow the reset line to be held down for some period
+	;- - - - - - - - - - - - - - - - - - - - - - - - - - -
+idle_resetting_clk	; If the timer hasn't expired, wait.
 	BL  hold_time_elapsed
 	BLT idle_process_return
 	
@@ -2162,8 +2189,19 @@ idle_resetting	; If the timer hasn't expired, wait.
 	TST  LR, #DUT_RESET
 	BEQ  %f0
 	
-	; Reset signal is still high, clear it
-	MOV  LR, #0
+	; Is the clock signal still high?
+	TST  LR, #DUT_CLK
+	BEQ  %f1
+	
+	; The clock is high, clear it.
+	MOV  LR, #DUT_RESET
+	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
+	BL   reset_timer
+	B    idle_process_return
+	
+	; Reset signal is still high, but the clock is low.
+	; Clear the reset
+1	MOV  LR, #0
 	STRH LR, [R12, #FPGA_REG_DUT_CONTROL]
 	BL   reset_timer
 	B    idle_process_return
