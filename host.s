@@ -432,6 +432,11 @@ LCD_SET_ADDR	EQU 1<<7
 	DCB "Jonathan Heathcote, University of Manchester "
 	DCB "(c) August 2012"
 	
+	; Initial LCD Message
+	    ;----------------;
+LCD_MESSAGE	DCB " Ackie Dbg Mon. "
+	DCB "(c) JDH/UoM 2012"
+	
 	ALIGN
 	
 	;------------------------------------------------------
@@ -661,8 +666,9 @@ main	; Set the default MMU translation table from ROM
 	; Write spaces to the request buffer
 	MOVX R0, #LCD_REQUEST_BUFFER
 	MOV  R1, #LCD_BUFFER_SIZE
-	MOV  R2, #' '
-0	STRB R2, [R0], #1
+	ADRL R3, LCD_MESSAGE
+0	LDRB R2, [R3], #1
+	STRB R2, [R0], #1
 	SUBS R1, R1, #1
 	BNE  %b0
 	
@@ -670,7 +676,7 @@ main	; Set the default MMU translation table from ROM
 	; routine replaces them.
 	MOVX R0, #LCD_CONTENTS_BUFFER
 	MOV  R1, #LCD_BUFFER_SIZE
-	MOV  R2, #'J'
+	MOV  R2, #0
 0	STRB R2, [R0], #1
 	SUBS R1, R1, #1
 	BNE  %b0
